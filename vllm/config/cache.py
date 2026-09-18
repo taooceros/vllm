@@ -18,6 +18,7 @@ logger = init_logger(__name__)
 
 CacheDType = Literal[
     "auto",
+    "float32",
     "float16",
     "bfloat16",
     "fp8",
