@@ -1,0 +1,73 @@
+{
+  "format": 1,
+  "source_commit": "20c83c18189b18d7898b615814bec0479eb981d4",
+  "source_repository": "admission-control-vllm local research snapshot",
+  "owner": "vllm",
+  "workspace_files": [
+    {
+      "path": "admission_control/core/__init__.py",
+      "sha256": "5fb0a69cc7a93d11bb2c4f97e7e4964d5ade255bb1c23d7877bea1f7ccaf1f66",
+      "bytes": 1396
+    },
+    {
+      "path": "admission_control/core/constants.py",
+      "sha256": "1762f9e2dcb1e3c65433c56c82e8728491a9718603b2ca1c81fd349fb5993e5f",
+      "bytes": 1917
+    },
+    {
+      "path": "admission_control/core/models.py",
+      "sha256": "ae934848ddaf18d92ebd6e2115fd27a77df6d9454ac06a4d731368113f1d3d2d",
+      "bytes": 16315
+    },
+    {
+      "path": "admission_control/serving/__init__.py",
+      "sha256": "c92010aeb79091d5467b17a340bc66a627997d156024921b17a546eb65ce4250",
+      "bytes": 621
+    },
+    {
+      "path": "admission_control/serving/client.py",
+      "sha256": "7784d970947e59ab00eef03344990f4a211017e6262da208e1aea19c15811379",
+      "bytes": 5903
+    },
+    {
+      "path": "admission_control/serving/orchestrator.py",
+      "sha256": "77bedbb8eb16170d5b5ad27745b850220f172461e7b7d0185c41002369d984e6",
+      "bytes": 11604
+    },
+    {
+      "path": "admission_control/serving/tracer.py",
+      "sha256": "37db1a0108740234aca83582f728eec879b3f91a842ee05d5cc5129c1d3895f5",
+      "bytes": 9796
+    },
+    {
+      "path": "admission_control/serving/worker.py",
+      "sha256": "b577403b980c4ce8b875e4eaf13b190ad1c36ac183d75e02d10da8776f742142",
+      "bytes": 43627
+    },
+    {
+      "path": "hetero/engine_actor.py",
+      "sha256": "371c7686800079c8776863fca7d5ef227a38af2572ec12927148ac90d26bbe81",
+      "bytes": 71536
+    },
+    {
+      "path": "hetero/inproc_engine.py",
+      "sha256": "1218a6fae1b9dcc1bfce52a6aa657f812b2bf2e3586c2a660fb67707149bc82c",
+      "bytes": 13715
+    },
+    {
+      "path": "hetero/kv_transport.py",
+      "sha256": "447187f311bb7bed23a77782d0e3a5ef86624757f79a401f3d0c7daa67174fe7",
+      "bytes": 22468
+    },
+    {
+      "path": "hetero/scheduler.py",
+      "sha256": "6e2aae6d68d1dc2af9d9348794f6cc145be61ace77fabb848f2b763930742979",
+      "bytes": 33444
+    },
+    {
+      "path": "hetero/serving_http.py",
+      "sha256": "0c2c6ca6f1654e2f6e2e2cdc74b378b2ea2d720e9a58cce7d99746f23d123bd3",
+      "bytes": 6757
+    }
+  ]
+}

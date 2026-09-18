@@ -108,3 +108,25 @@ If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs
 ## Media Kit
 
 - If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+
+## Experimental heterogeneous TPU serving research
+
+The [research subtree](experimental/heterogeneous-serving/) preserves the measured
+`HeteroScheduler`, engine actors, KV transport, HTTP wrapper, and admission-control
+code without changing its original workspace imports. The native
+[cache configuration](vllm/config/cache.py) adds `float32` to `CacheDType`.
+
+This branch starts at the measured upstream commit
+`0ba2aa35a81dcc3246b26291368b53fa2389c7d7`, not current upstream main.
+[Migration provenance](experimental/heterogeneous-serving/migration.json) records
+original paths and hashes; [native build metadata](experimental/heterogeneous-serving/native-build.json)
+records the paired TPU base, original/current native hashes, API-source correspondence,
+and CPU smoke results. Twelve scheduler/engine/cache API files match the preserved
+measured runtime byte-for-byte. Pydantic validation accepts FP32 and rejects an
+unsupported dtype; this is not a full engine import or serving test.
+
+Use the [llm-d experimental orchestrator](https://github.com/taooceros/llm-d/tree/research/heterogeneous-tpu-20260918/experimental/heterogeneous-serving)
+to assemble the sibling fork payloads into the original flat workspace. This subtree
+is not independently installable and is not a native Go scheduler integration.
+Historical hardware results apply to the original frozen runtime. No TPU workload,
+model deployment, or new hardware qualification was performed for this migration.

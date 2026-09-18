@@ -1,0 +1,115 @@
+{
+  "format": 1,
+  "integration": "exact-measured-native-base",
+  "upstream_repository": "https://github.com/vllm-project/vllm",
+  "upstream_base_commit": "0ba2aa35a81dcc3246b26291368b53fa2389c7d7",
+  "native_patch_commit": "80ac983213ca0862fc179342e556fc548b2be011",
+  "native_files": [
+    {
+      "path": "vllm/config/cache.py",
+      "upstream_sha256": "c11985dd15e01051959e7dfcbb45435530e38d2991b0766966a7eceaa71df579",
+      "current_sha256": "0a41c137dc70c8fdc835062e65ca86a094c9c3d515008eb7bdac1163d0dc3cb4",
+      "measured_runtime_sha256": "0a41c137dc70c8fdc835062e65ca86a094c9c3d515008eb7bdac1163d0dc3cb4"
+    }
+  ],
+  "historical_patch_manifest": {
+    "workspace_path": "hetero/native_backend_patch.json",
+    "sha256": "148b4295bf83c0eaa473b11fff5c7c643092f1873200cef1f52b07a2265861ed",
+    "unchanged": true
+  },
+  "paired_native_bases": {
+    "vllm": "0ba2aa35a81dcc3246b26291368b53fa2389c7d7",
+    "tpu_inference": "8d31f0866147d394dafce923c7cce090a862ad70"
+  },
+  "api_compatibility": {
+    "basis": "Source correspondence with preserved measured runtime; not a latest-main port or complete local import/inference test.",
+    "native_files": [
+      {
+        "path": "vllm/v1/core/sched/async_scheduler.py",
+        "sha256": "da6343d7e7c394a1738cf72905cbecc208003ffa461ccb441268333a3eb9f884",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "vllm/v1/core/sched/scheduler.py",
+        "sha256": "bc7c7e3d748bd94877b447188e2b2b90994544cfede115b60768edbf0b866906",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "vllm/v1/core/sched/interface.py",
+        "sha256": "e6c2cf0382865e76eada4061a9db564351f7fc8d9af47b7d0ab0f371a873ba65",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "vllm/v1/core/sched/request_queue.py",
+        "sha256": "4b8d938e5fb8152fe61030b8aa991f983fcac9a405c37ed8908045e05e82ae5e",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "vllm/v1/core/kv_cache_coordinator.py",
+        "sha256": "cf1a92db18d079403d8d4c8c9e5b0b615d2a116e3e8ffb5ffb39352a01c04b29",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "vllm/v1/core/kv_cache_manager.py",
+        "sha256": "e9fc822688f3ce497062fbc8fea62424af0b2fe6a80ec72cfc35291acbdaf5a6",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "vllm/v1/core/block_pool.py",
+        "sha256": "202a13cb129174849d798019aaedc04c59775ec2a4b9dfcc7c1e3c563a43a661",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "vllm/v1/request.py",
+        "sha256": "92124fbad28cda49bd06fa12c2c4fd5f53fc9381ddb4dc35f275c5ccfbd27378",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "vllm/v1/engine/llm_engine.py",
+        "sha256": "17e5edfc625c77e9663368c7d69136e5e5935ee81608a65be3996411d502225e",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "vllm/v1/engine/core.py",
+        "sha256": "3ae1381a6af841e21058c825702382dc66faae45c950ac5acb8495d2d3d05aad",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "vllm/v1/engine/core_client.py",
+        "sha256": "2d83952580e23abca33c3bb5f93edc349ea0e10da358bcb41b385f8d066e2a0b",
+        "matches_preserved_runtime": true
+      },
+      {
+        "path": "vllm/engine/arg_utils.py",
+        "sha256": "56b079c44a4a4d1ace7b8182ab1caeecbc163826802567284560acfccbd22da6",
+        "matches_preserved_runtime": true
+      }
+    ],
+    "copied_runtime_files_verified": 13,
+    "copied_runtime_modified": false
+  },
+  "migration_verification": {
+    "status": "passed",
+    "backend": "cpu",
+    "jax": "0.10.2",
+    "flax": "0.12.4",
+    "checks": [
+      "CacheDType Pydantic accepts FP32 and rejects float64",
+      "Gemma4 rejects unsupported dtype, MoE, PLE, PP",
+      "zero-layer native Gemma4Model gathered and supplied embeddings retain BF16 parameters and produce FP32 activations",
+      "three actual decoder norm constructors preserve BF16 weights with FP32 outputs",
+      "unset activation dtype retains BF16 behavior"
+    ],
+    "limitations": "AST-extracted native classes and constructor statements; CPU primitive smoke, not full imports, model execution, TPU kernels, distributed serving, or hardware requalification"
+  },
+  "assembly": {
+    "orchestrator": "https://github.com/taooceros/llm-d/tree/research/heterogeneous-tpu-20260918/experimental/heterogeneous-serving",
+    "layout": "Use the llm-d assembly tool to reproduce flat workspace paths from sibling forks. Do not treat this subtree as an independently installable Python package.",
+    "source_manifest": "migration.json"
+  },
+  "qualification": {
+    "hardware_runs_performed_during_migration": false,
+    "claim": "Historical physical qualification belongs to the original frozen research runtime and evidence. Byte-identical native sources and CPU checks do not newly qualify these fork builds.",
+    "unsupported": "No latest-main API compatibility claim; no full dependency import/build, model deployment, TPU kernels, Ray actor launch or distributed scheduling exercised during migration. Gemma4 FP32 activation mode rejects MoE, PLE and PP != 1."
+  }
+}
