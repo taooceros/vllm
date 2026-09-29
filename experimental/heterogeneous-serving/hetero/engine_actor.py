@@ -130,6 +130,61 @@ class HeteroEngine:
         self._continuations: Dict[str, Dict[str, Any]] = {}
         self._migrated: Dict[str, str] = {}
         self._cache_operation_lock = asyncio.Lock()
+        self._kv_notices: Dict[str, asyncio.Queue] = {}
+        self._kv_refs: Dict[str, Dict[int, Any]] = {}
+        self._kv_early: Dict[str, Dict[int, list]] = {}
+
+    # KV transport completions arrive from worker background threads.
+    KV_CHUNK_TIMEOUT_S = 120.0
+
+    async def omp_kv_notify(self, transaction_id: str, message: Dict[str, Any]) -> None:
+        queue = self._kv_notices.get(transaction_id)
+        if queue is not None:
+            queue.put_nowait(message)
+
+    async def omp_kv_refs(self, transaction_id: str, keys: List[int]) -> List[Any]:
+        """Hand piece refs to worker threads through Ray, preserving ownership."""
+        refs = self._kv_refs[transaction_id]
+        return [refs[key] for key in keys]
+
+    async def _kv_chunk(self, transaction_id: str, kind: str, workers: int, chunk: int) -> list:
+        """Every worker's completion of one numbered chunk; later chunks are held back.
+
+        With two chunks in flight a fast worker can finish chunk k+1 before a
+        slow worker finishes chunk k, so completions are matched by chunk number.
+        """
+        queue = self._kv_notices[transaction_id]
+        early = self._kv_early.setdefault(transaction_id, {})
+        received: Dict[int, Dict[str, Any]] = {}
+        for message in early.pop(chunk, []):
+            received[message["process_index"]] = message
+        deadline = time.monotonic() + self.KV_CHUNK_TIMEOUT_S
+        while len(received) < workers:
+            try:
+                message = await asyncio.wait_for(queue.get(), max(0.0, deadline - time.monotonic()))
+            except asyncio.TimeoutError:
+                evidence: Any = "unavailable"
+                with contextlib.suppress(Exception):
+                    async with self._cache_operation():
+                        evidence = self.engine_core.model_executor.collective_rpc("omp_kv_debug")
+                raise TimeoutError(
+                    f"KV {kind} chunk {chunk} timed out after {self.KV_CHUNK_TIMEOUT_S}s with "
+                    f"{len(received)}/{workers} completions; workers: {json.dumps(evidence)[:6000]}"
+                ) from None
+            if message.get("kind") != kind:
+                raise RuntimeError(f"unexpected {message.get('kind')} KV completion during {kind}")
+            if message.get("error"):
+                raise RuntimeError(f"worker {message['process_index']} KV {kind} chunk "
+                                   f"{message.get('chunk')} failed: {message['error']}")
+            if message["chunk"] != chunk:
+                if message["chunk"] < chunk:
+                    raise RuntimeError(f"stale KV {kind} completion for chunk {message['chunk']}")
+                early.setdefault(message["chunk"], []).append(message)
+                continue
+            if message["process_index"] in received:
+                raise RuntimeError(f"duplicate worker KV {kind} completion for chunk {chunk}")
+            received[message["process_index"]] = message
+        return [received[index] for index in sorted(received)]
 
     def ping(self) -> str:
         return f"PONG {self.instance_id}@{self.hostname}"
@@ -916,6 +971,21 @@ class HeteroEngine:
                     native.skip_reading_prefix_cache = identity["mechanism"] == "recompute"
                     record.update(frontend=frontend, native=native, wave=wave,
                                   continuation_id=native.request_id)
+                    addressing = None
+
+                    def prepare_worker_state() -> None:
+                        # Caller holds the drained native step lock.
+                        record["worker_prepared"] = True
+                        evidence["worker_prepare"] = self.engine_core.model_executor.collective_rpc(
+                            "omp_prepare_continuation_state", args=({
+                                "request_id": native.request_id, "transaction_id": txn,
+                                "destination_generation": self.generation,
+                                "prompt_token_ids": prompt, "generated_token_ids": generated,
+                                "num_computed_tokens": computed, "sampling_params": native.sampling_params,
+                                "block_ids": blocks.get_block_ids(),
+                            },))
+                        self.engine._publish_snapshot()
+
                     async with self._cache_operation():
                         blocks = self.scheduler.omp_prepare_continuation(txn, native)
                         native.num_computed_tokens = computed
@@ -934,25 +1004,23 @@ class HeteroEngine:
                             evidence["export"] = {
                                 key: exported.get(key) for key in (
                                     "request_id", "instance_id", "transaction_id",
-                                    "source_generation", "source_epoch", "export_s", "bytes")
+                                    "source_generation", "source_epoch", "export_s", "bytes",
+                                    "paused_s", "chunks", "gather_s", "d2h_s")
                             }
-                            evidence["import"] = self.engine_core.model_executor.collective_rpc(
-                                "omp_import_blocks", args=(addressing, exported))
                             if getattr(self.scheduler, "needs_kv_cache_zeroing", False):
+                                # Registered before any step can drain the new-block list.
                                 imported_blocks = {block for group in addressing["groups"]
                                                    for block in group["block_ids"]}
                                 self.scheduler._skip_zero_block_ids.update(imported_blocks)
                                 record["imported_blocks"] = imported_blocks
-                        record["worker_prepared"] = True
-                        evidence["worker_prepare"] = self.engine_core.model_executor.collective_rpc(
-                            "omp_prepare_continuation_state", args=({
-                                "request_id": native.request_id, "transaction_id": txn,
-                                "destination_generation": self.generation,
-                                "prompt_token_ids": prompt, "generated_token_ids": generated,
-                                "num_computed_tokens": computed, "sampling_params": native.sampling_params,
-                                "block_ids": blocks.get_block_ids(),
-                            },))
-                        self.engine._publish_snapshot()
+                        else:
+                            prepare_worker_state()
+                    if exported is not None:
+                        # The continuation is allocated but not admitted, so its
+                        # pages are untouched while this engine keeps stepping.
+                        evidence["import"] = await self._import_kv(txn, addressing, exported)
+                        async with self._cache_operation():
+                            prepare_worker_state()
                     record["payload"] = {key: value for key, value in payload.items() if key != "kv_export"}
                 except Exception as exc:
                     reasons.append(f"native_prepare_failed: {exc}")
@@ -981,6 +1049,73 @@ class HeteroEngine:
                 ids.append(int(table[logical].block_id))
             groups.append({**group, "block_ids": ids})
         return {"num_computed_tokens": source["num_computed_tokens"], "groups": groups}
+
+    async def _import_kv(self, txn: str, addressing: Dict[str, Any],
+                         exported: Dict[str, Any]) -> list:
+        """Pipelined import: workers fetch/upload in the background while this
+        engine steps; each pause only scatters a staged chunk and queues the next."""
+        from .kv_transport import DEFAULT_STAGE_BYTES_PER_DEVICE, split_refs
+
+        rpc = self.engine_core.model_executor.collective_rpc
+        notifier = ray.get_runtime_context().current_actor
+        self._kv_notices[txn] = asyncio.Queue()
+        exported, self._kv_refs[txn] = split_refs(exported)
+        rows: Dict[int, Dict[str, Any]] = {}
+        cursor, outstanding, paused_s, pauses, chunks = 0, 0, 0.0, 0, 0
+        total = len(exported["arrays"])
+
+        async def advance(commit: bool) -> list:
+            nonlocal cursor, outstanding, paused_s, pauses
+            first = cursor == 0 and not commit
+            paused = time.monotonic()
+            async with self._cache_operation():
+                results = rpc("omp_import_advance", args=(
+                    txn, commit, cursor, DEFAULT_STAGE_BYTES_PER_DEVICE, notifier,
+                    addressing if first else None, exported if first else None))
+            paused_s += time.monotonic() - paused
+            pauses += 1
+            following = {row["next"] for row in results}
+            submitted = {row["submitted"] for row in results}
+            if len(following) != 1 or len(submitted) != 1:
+                raise RuntimeError("workers disagree on the KV import chunk boundary")
+            cursor = following.pop()
+            outstanding += submitted.pop() - (1 if commit else 0)
+            return results
+
+        try:
+            results = await advance(False)
+            workers = len(results)
+            if cursor < total:
+                await advance(False)
+            while outstanding:
+                staged = await self._kv_chunk(txn, "import", workers, chunks)
+                committed = await advance(True)
+                chunks += 1
+                by_process = {row["process_index"]: row["committed"] for row in committed}
+                for stage in staged:
+                    row = rows.setdefault(stage["process_index"], {
+                        "process_index": stage["process_index"], "arrays_written": 0,
+                        "bytes": 0, "fetched_bytes": 0, "head_conversions": [],
+                        "fetch_s": 0.0, "stage_s": 0.0, "scatter_s": 0.0})
+                    commit = by_process[stage["process_index"]]
+                    row["arrays_written"] += commit["arrays_written"]
+                    row["scatter_s"] += commit["scatter_s"]
+                    for key in ("bytes", "fetched_bytes", "fetch_s", "stage_s"):
+                        row[key] += stage[key]
+                    row["head_conversions"].extend(stage["head_conversions"])
+            if cursor != total:
+                raise RuntimeError("KV import ended before covering every payload array")
+        except BaseException:
+            with contextlib.suppress(Exception):
+                async with self._cache_operation():
+                    rpc("omp_kv_discard", args=(txn,))
+            raise
+        finally:
+            self._kv_notices.pop(txn, None)
+            self._kv_refs.pop(txn, None)
+            self._kv_early.pop(txn, None)
+        return [{**row, "chunks": chunks, "pauses": pauses, "paused_s": paused_s}
+                for _, row in sorted(rows.items())]
 
     async def commit_continuation(self, *, transaction_id: str,
                                   ownership: Dict[str, Any]) -> Dict[str, Any]:
@@ -1187,23 +1322,66 @@ class HeteroEngine:
 
     async def export_request_kv(self, *, request_id: str, transaction_id: str,
                                 source_generation: int, source_epoch: int) -> Dict[str, Any]:
-        """Gather only this transaction's valid retired KV, never stale physical pages."""
-        from .kv_transport import assemble_exports
+        """Gather only this transaction's valid retired KV, never stale physical pages.
+
+        The engine pauses only while each chunk is gathered on device; workers
+        copy it to the host and publish it on background threads while the
+        engine keeps serving its other requests. The request itself stays fenced.
+        """
+        from .kv_transport import DEFAULT_STAGE_BYTES_PER_DEVICE, assemble_manifest
 
         identity = self._source_identity(request_id, source_generation, source_epoch)
+        rpc = self.engine_core.model_executor.collective_rpc
+        notifier = ray.get_runtime_context().current_actor
         async with self._transaction_lock(transaction_id):
             record = self._transactions[transaction_id]
             if (record.get("source") != identity or record.get("resume") or record.get("release")
                     or self._quiesced.get(request_id) != transaction_id):
                 raise RuntimeError("KV export requires this source transaction's live fence")
             started = time.monotonic()
-            async with self._cache_operation():
-                addressing = self.scheduler.omp_block_ids(request_id)
-                shards = self.engine_core.model_executor.collective_rpc(
-                    "omp_export_blocks", args=(addressing,))
-                payload = assemble_exports(shards)
+            self._kv_notices[transaction_id] = asyncio.Queue()
+            addressing, layouts = None, []
+            cursor, total, outstanding = 0, None, 0
+            stages, gather_s, paused_s, chunks = [], 0.0, 0.0, 0
+            try:
+                while total is None or cursor < total or outstanding:
+                    # At most two gathered chunks occupy device memory at once.
+                    if (total is None or cursor < total) and outstanding < 2:
+                        paused = time.monotonic()
+                        async with self._cache_operation():
+                            if addressing is None:
+                                addressing = self.scheduler.omp_block_ids(request_id)
+                            gathered = rpc("omp_export_gather", args=(
+                                transaction_id, addressing, cursor,
+                                DEFAULT_STAGE_BYTES_PER_DEVICE, notifier))
+                        paused_s += time.monotonic() - paused
+                        following = {row["next"] for row in gathered}
+                        if len(following) != 1:
+                            raise RuntimeError("workers disagree on the KV export chunk boundary")
+                        if cursor == 0:
+                            layouts = [row["layout"] for row in gathered]
+                        cursor, total = following.pop(), gathered[0]["total"]
+                        gather_s += max(row["gather_s"] for row in gathered)
+                        outstanding += 1
+                        chunks += 1
+                        continue
+                    stages.extend(await self._kv_chunk(transaction_id, "export", len(layouts),
+                                                       chunks - outstanding))
+                    outstanding -= 1
+                payload = assemble_manifest(layouts, addressing, stages)
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    async with self._cache_operation():
+                        rpc("omp_kv_discard", args=(transaction_id,))
+                raise
+            finally:
+                self._kv_notices.pop(transaction_id, None)
+                self._kv_early.pop(transaction_id, None)
             return {**identity, "transaction_id": transaction_id, "instance_id": self.instance_id,
-                    "export_s": time.monotonic() - started, **payload}
+                    "export_s": time.monotonic() - started, "paused_s": paused_s,
+                    "chunks": chunks, "gather_s": gather_s,
+                    "d2h_s": max((row["d2h_s"] for row in stages), default=0.0),
+                    **payload}
 
     def migration_state(self) -> Dict[str, Any]:
         return {
