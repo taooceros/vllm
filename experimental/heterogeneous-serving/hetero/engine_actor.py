@@ -65,6 +65,9 @@ class EngineSettings:
     startup_device_trace: bool = False
     # Extra process environment for the engine driver and every TPU worker.
     worker_env: Dict[str, str] = dataclasses.field(default_factory=dict)
+    # fast_graph traces the abstract model graph (restore builder and normal loader)
+    # under restore_graph.cheap_tracer_sharding_errors: a jax 0.10 O(N^2) workaround.
+    fast_graph: bool = False
 
     def __post_init__(self) -> None:
         for field, choices in (
@@ -77,12 +80,10 @@ class EngineSettings:
             value = getattr(self, field)
             if value not in choices:
                 raise ValueError(f"unsupported {field} {value!r}; expected one of {choices}")
-        if not isinstance(self.weight_snapshot_verify, bool):
-            raise ValueError("weight_snapshot_verify must be a boolean")
-        if not isinstance(self.startup_profile, bool):
-            raise ValueError("startup_profile must be a boolean")
-        if not isinstance(self.startup_device_trace, bool):
-            raise ValueError("startup_device_trace must be a boolean")
+        for field in ("weight_snapshot_verify", "startup_profile", "startup_device_trace",
+                      "fast_graph"):
+            if not isinstance(getattr(self, field), bool):
+                raise ValueError(f"{field} must be a boolean")
         if self.backend_revision != BACKEND_REVISION:
             raise ValueError(
                 f"backend_revision {self.backend_revision!r} does not match "
@@ -337,6 +338,7 @@ class HeteroEngine:
             "startup_device_trace": self.settings.startup_device_trace,
             "weight_snapshot_generation": self.__dict__.setdefault(
                 "_weight_snapshot_generation", uuid.uuid4().hex),
+            "fast_graph": self.settings.fast_graph,
         }
 
     async def initialize(self, *, pg_name: str, timeout_s: float = 3600.0) -> Dict[str, Any]:
