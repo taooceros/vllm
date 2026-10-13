@@ -335,6 +335,8 @@ class HeteroEngine:
             "startup_profile": self.settings.startup_profile,
             "startup_compile_bundle": self.settings.startup_compile_bundle,
             "startup_device_trace": self.settings.startup_device_trace,
+            "weight_snapshot_generation": self.__dict__.setdefault(
+                "_weight_snapshot_generation", uuid.uuid4().hex),
         }
 
     async def initialize(self, *, pg_name: str, timeout_s: float = 3600.0) -> Dict[str, Any]:
@@ -467,7 +469,14 @@ class HeteroEngine:
         """Explicitly publish every worker's final, device-resident runner state."""
         if self.state != "ready" or self._inflight:
             raise RuntimeError("snapshot requires a ready, idle engine")
-        return self.engine_core.model_executor.collective_rpc("omp_snapshot_weights")
+        return self.engine_core.model_executor.collective_rpc(
+            "omp_snapshot_weights", args=(uuid.uuid4().hex,))
+
+    def weight_fingerprint(self) -> List[Dict[str, Any]]:
+        """Validation-only byte digests of live weights, outside snapshot timing."""
+        if self.state != "ready" or self._inflight:
+            raise RuntimeError("weight fingerprint requires a ready, idle engine")
+        return self.engine_core.model_executor.collective_rpc("omp_weight_fingerprint")
 
     def worker_kv_evidence(self) -> List[Dict[str, Any]]:
         return self.engine_core.model_executor.collective_rpc("omp_kv_cache_evidence")
