@@ -93,6 +93,11 @@ class EngineSettings:
     exec_bank_dir: str = "/root/.cache/omp_exec_bank"
     # Gate test: this instance process rank refuses its bank, so every rank must fall back.
     exec_bank_sabotage_rank: Optional[int] = None
+    # Parked-target pre-read (hetero/preread.py): with prespawn and weight_snapshot='read', each
+    # parked worker starts a CPU-only child that writes this rank's snapshot from the checkpoint
+    # before the release; the released worker waits for it (bounded) and restores from it.
+    preread: bool = False
+    preread_timeout_s: float = 900.0
 
     def __post_init__(self) -> None:
         for field, choices in (
@@ -131,6 +136,13 @@ class EngineSettings:
                 or not isinstance(self.exec_bank_sabotage_rank, int)
                 or self.exec_bank_sabotage_rank < 0):
             raise ValueError("exec_bank_sabotage_rank must be a process rank >= 0 with exec_bank='read'")
+        if not isinstance(self.preread, bool):
+            raise ValueError("preread must be a boolean")
+        if self.preread and not (self.prespawn and self.weight_snapshot == "read"):
+            raise ValueError("preread requires prespawn=True and weight_snapshot='read'")
+        if (isinstance(self.preread_timeout_s, bool) or not isinstance(self.preread_timeout_s, (int, float))
+                or not self.preread_timeout_s > 0):
+            raise ValueError("preread_timeout_s must be a positive number")
         if self.backend_revision != BACKEND_REVISION:
             raise ValueError(
                 f"backend_revision {self.backend_revision!r} does not match "
@@ -392,6 +404,8 @@ class HeteroEngine:
             "exec_bank": self.settings.exec_bank,
             "exec_bank_dir": self.settings.exec_bank_dir,
             "exec_bank_sabotage_rank": self.settings.exec_bank_sabotage_rank,
+            "preread": self.settings.preread,
+            "preread_timeout_s": float(self.settings.preread_timeout_s),
             # Fresh per initialize(): unanimity votes of an earlier attempt are never read.
             "exec_bank_nonce": uuid.uuid4().hex,
         }
