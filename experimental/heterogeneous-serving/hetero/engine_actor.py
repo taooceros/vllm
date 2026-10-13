@@ -39,6 +39,18 @@ EXTRA_ENV_VARS_TO_COPY = (
 )
 
 
+# (activation_dtype, kv_cache_dtype, matmul_precision) combinations the native
+# backend serves.  Full bf16 state is the default: activations follow the bf16
+# model dtype (activation_dtype unset), bf16 KV, default matmul precision.  The
+# FP32-state profile (fp32 activations, fp32 KV, highest) stays selectable for
+# fp32 references.  Mixed q/KV dtypes are refused: the RPA v3 kernel has no
+# mixed-dtype matmul path (Mosaic: "Bad rhs type").
+NUMERIC_PROFILES = {
+    (None, "bfloat16", "default"): "bf16",
+    ("float32", "float32", "highest"): "fp32",
+}
+
+
 @dataclasses.dataclass
 class EngineSettings:
     """Frozen per-instance engine configuration for one static arm."""
@@ -46,8 +58,9 @@ class EngineSettings:
     model: str = DEFAULT_MODEL
     dtype: str = "bfloat16"
     kv_cache_dtype: str = "bfloat16"
-    activation_dtype: str = "float32"
-    matmul_precision: str = "highest"
+    # None (unset): activations follow the model dtype.
+    activation_dtype: Optional[str] = None
+    matmul_precision: str = "default"
     backend_revision: str = BACKEND_REVISION
     runtime_revision: str = RUNTIME_REVISION
     max_model_len: int = 8192
@@ -73,13 +86,20 @@ class EngineSettings:
         for field, choices in (
             ("dtype", ("auto", "half", "float16", "bfloat16", "float", "float32")),
             ("kv_cache_dtype", ("bfloat16", "float32")),
-            ("activation_dtype", ("float32",)),
-            ("matmul_precision", ("highest",)),
+            ("activation_dtype", (None, "float32")),
+            ("matmul_precision", ("default", "highest")),
             ("weight_snapshot", ("off", "write", "read")),
         ):
             value = getattr(self, field)
             if value not in choices:
                 raise ValueError(f"unsupported {field} {value!r}; expected one of {choices}")
+        profile = (self.activation_dtype, self.kv_cache_dtype, self.matmul_precision)
+        if profile not in NUMERIC_PROFILES:
+            raise ValueError(
+                f"unsupported numeric profile (activation_dtype, kv_cache_dtype, matmul_precision)"
+                f"={profile!r}; expected one of {sorted(NUMERIC_PROFILES, key=str)}")
+        if self.activation_dtype is None and self.dtype in ("auto", "float32", "float"):
+            raise ValueError("unset activation_dtype requires an explicit 16-bit model dtype")
         for field in ("weight_snapshot_verify", "startup_profile", "startup_device_trace",
                       "fast_graph"):
             if not isinstance(getattr(self, field), bool):

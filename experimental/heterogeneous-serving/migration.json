@@ -46,8 +46,8 @@
     },
     {
       "path": "hetero/engine_actor.py",
-      "sha256": "4aead08781e6d7b0d74551ef5d552808306f2ba857333cdac2419eb93b95bbd7",
-      "bytes": 86249
+      "sha256": "e6711ad2cdd292c4bc68ef707f8d625819a05b39a3b7dd8d40967cbde778a08d",
+      "bytes": 87415
     },
     {
       "path": "hetero/inproc_engine.py",
@@ -68,6 +68,11 @@
       "path": "hetero/serving_http.py",
       "sha256": "964a8d55a1976e2ecce535eacfc2327d49ffc6193def70fc10db51fea58fcbac",
       "bytes": 9188
+    },
+    {
+      "path": "tests/test_full_bf16_state.py",
+      "sha256": "369f5f851fca34cc5b85f41f24e0fea7c47d3f95c3a8f24ff5ce02496bead7f6",
+      "bytes": 4909
     },
     {
       "path": "tests/test_kv_transport.py",
