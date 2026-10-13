@@ -45,7 +45,7 @@ class EngineSettings:
 
     model: str = DEFAULT_MODEL
     dtype: str = "bfloat16"
-    kv_cache_dtype: str = "float32"
+    kv_cache_dtype: str = "bfloat16"
     activation_dtype: str = "float32"
     matmul_precision: str = "highest"
     backend_revision: str = BACKEND_REVISION
@@ -72,7 +72,7 @@ class EngineSettings:
     def __post_init__(self) -> None:
         for field, choices in (
             ("dtype", ("auto", "half", "float16", "bfloat16", "float", "float32")),
-            ("kv_cache_dtype", ("float32",)),
+            ("kv_cache_dtype", ("bfloat16", "float32")),
             ("activation_dtype", ("float32",)),
             ("matmul_precision", ("highest",)),
             ("weight_snapshot", ("off", "write", "read")),
