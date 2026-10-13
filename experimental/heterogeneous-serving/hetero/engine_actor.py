@@ -408,6 +408,7 @@ class HeteroEngine:
             "preread_timeout_s": float(self.settings.preread_timeout_s),
             # Fresh per initialize(): unanimity votes of an earlier attempt are never read.
             "exec_bank_nonce": uuid.uuid4().hex,
+            "profile_load": os.environ.get("OMP_PROFILE_LOAD") == "1",
         }
 
     async def initialize(self, *, pg_name: str, timeout_s: float = 3600.0,
