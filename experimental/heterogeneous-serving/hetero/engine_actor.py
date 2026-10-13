@@ -72,6 +72,9 @@ class EngineSettings:
     seed: int = 0
     weight_snapshot: str = "off"
     weight_snapshot_verify: bool = True
+    # Snapshot files live under <weight_snapshot_root>/<layout>/<instance>/rank<k>/. A first-switch
+    # (cold) run points it and exec_bank_dir at a per-run scope (hetero/run_scope.py).
+    weight_snapshot_root: str = "/dev/shm/omp_weights"
     startup_profile: bool = False
     compilation_cache_dir: Optional[str] = None
     startup_compile_bundle: Optional[str] = None
@@ -117,8 +120,10 @@ class EngineSettings:
             raise ValueError("prespawn must be a boolean")
         if self.exec_bank not in (None, "write", "read"):
             raise ValueError(f"unsupported exec_bank {self.exec_bank!r}; expected None, 'write' or 'read'")
-        if not isinstance(self.exec_bank_dir, str) or not os.path.isabs(self.exec_bank_dir):
-            raise ValueError("exec_bank_dir must be an absolute path")
+        for field in ("exec_bank_dir", "weight_snapshot_root"):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not os.path.isabs(value):
+                raise ValueError(f"{field} must be an absolute path")
         if self.exec_bank is not None and self.enforce_eager:
             raise ValueError("exec_bank requires precompilation (enforce_eager=False)")
         if self.exec_bank_sabotage_rank is not None and (
@@ -376,6 +381,7 @@ class HeteroEngine:
             "runtime_revision": self.settings.runtime_revision,
             "weight_snapshot": self.settings.weight_snapshot,
             "weight_snapshot_verify": self.settings.weight_snapshot_verify,
+            "weight_snapshot_root": self.settings.weight_snapshot_root,
             "startup_profile": self.settings.startup_profile,
             "startup_compile_bundle": self.settings.startup_compile_bundle,
             "startup_device_trace": self.settings.startup_device_trace,
