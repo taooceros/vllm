@@ -56,6 +56,8 @@ class EngineSettings:
     enable_prefix_caching: bool = False
     enforce_eager: bool = False
     seed: int = 0
+    weight_snapshot: str = "off"
+    weight_snapshot_verify: bool = True
 
     def __post_init__(self) -> None:
         for field, choices in (
@@ -63,10 +65,13 @@ class EngineSettings:
             ("kv_cache_dtype", ("float32",)),
             ("activation_dtype", ("float32",)),
             ("matmul_precision", ("highest",)),
+            ("weight_snapshot", ("off", "write", "read")),
         ):
             value = getattr(self, field)
             if value not in choices:
                 raise ValueError(f"unsupported {field} {value!r}; expected one of {choices}")
+        if not isinstance(self.weight_snapshot_verify, bool):
+            raise ValueError("weight_snapshot_verify must be a boolean")
         if self.backend_revision != BACKEND_REVISION:
             raise ValueError(
                 f"backend_revision {self.backend_revision!r} does not match "
@@ -307,6 +312,8 @@ class HeteroEngine:
             "matmul_precision": self.settings.matmul_precision,
             "backend_revision": self.settings.backend_revision,
             "runtime_revision": self.settings.runtime_revision,
+            "weight_snapshot": self.settings.weight_snapshot,
+            "weight_snapshot_verify": self.settings.weight_snapshot_verify,
         }
 
     async def initialize(self, *, pg_name: str, timeout_s: float = 3600.0) -> Dict[str, Any]:
@@ -431,6 +438,15 @@ class HeteroEngine:
 
     def worker_evidence(self) -> List[Dict[str, Any]]:
         return self.engine_core.model_executor.collective_rpc("omp_worker_evidence")
+
+    def worker_init_phases(self) -> List[Dict[str, Any]]:
+        return self.engine_core.model_executor.collective_rpc("omp_init_phases")
+
+    def snapshot_weights(self) -> List[Dict[str, Any]]:
+        """Explicitly publish every worker's final, device-resident runner state."""
+        if self.state != "ready" or self._inflight:
+            raise RuntimeError("snapshot requires a ready, idle engine")
+        return self.engine_core.model_executor.collective_rpc("omp_snapshot_weights")
 
     def worker_kv_evidence(self) -> List[Dict[str, Any]]:
         return self.engine_core.model_executor.collective_rpc("omp_kv_cache_evidence")
