@@ -34,6 +34,7 @@ EXTRA_ENV_VARS_TO_COPY = (
     "TPU_PROCESS_PORT",
     "JAX_PLATFORMS",
     "JAX_COMPILATION_CACHE_DIR",
+    "VLLM_XLA_CACHE_PATH",
     "OMP_HETERO_INSTANCE_ID",
 )
 
@@ -58,6 +59,12 @@ class EngineSettings:
     seed: int = 0
     weight_snapshot: str = "off"
     weight_snapshot_verify: bool = True
+    startup_profile: bool = False
+    compilation_cache_dir: Optional[str] = None
+    startup_compile_bundle: Optional[str] = None
+    startup_device_trace: bool = False
+    # Extra process environment for the engine driver and every TPU worker.
+    worker_env: Dict[str, str] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for field, choices in (
@@ -72,6 +79,10 @@ class EngineSettings:
                 raise ValueError(f"unsupported {field} {value!r}; expected one of {choices}")
         if not isinstance(self.weight_snapshot_verify, bool):
             raise ValueError("weight_snapshot_verify must be a boolean")
+        if not isinstance(self.startup_profile, bool):
+            raise ValueError("startup_profile must be a boolean")
+        if not isinstance(self.startup_device_trace, bool):
+            raise ValueError("startup_device_trace must be a boolean")
         if self.backend_revision != BACKEND_REVISION:
             raise ValueError(
                 f"backend_revision {self.backend_revision!r} does not match "
@@ -274,9 +285,16 @@ class HeteroEngine:
     def prepare_environment(self) -> Dict[str, Any]:
         """Applies this instance's runtime environment to the driver process."""
         intended = dict(self.instance["intended_runtime_env"])
+        intended.update(self.settings.worker_env)
+        self.instance["intended_runtime_env"].update(self.settings.worker_env)
+        if self.settings.compilation_cache_dir:
+            for key in ("JAX_COMPILATION_CACHE_DIR", "VLLM_XLA_CACHE_PATH"):
+                intended[key] = self.settings.compilation_cache_dir
+                self.instance["intended_runtime_env"][key] = self.settings.compilation_cache_dir
         intended.update(self.REQUIRED_ENV)
         existing = os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
-        merged = sorted(set(filter(None, existing.split(","))) | set(EXTRA_ENV_VARS_TO_COPY))
+        merged = sorted(set(filter(None, existing.split(","))) | set(EXTRA_ENV_VARS_TO_COPY)
+                        | set(self.settings.worker_env))
         intended["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(merged)
         for key, value in intended.items():
             os.environ[key] = value
@@ -314,6 +332,9 @@ class HeteroEngine:
             "runtime_revision": self.settings.runtime_revision,
             "weight_snapshot": self.settings.weight_snapshot,
             "weight_snapshot_verify": self.settings.weight_snapshot_verify,
+            "startup_profile": self.settings.startup_profile,
+            "startup_compile_bundle": self.settings.startup_compile_bundle,
+            "startup_device_trace": self.settings.startup_device_trace,
         }
 
     async def initialize(self, *, pg_name: str, timeout_s: float = 3600.0) -> Dict[str, Any]:
