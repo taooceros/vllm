@@ -2,21 +2,31 @@
 
 The caller owns request fencing, native block reservation and model identity.
 Every worker RPC must run with the engine's execution queue drained and step
-submission excluded: JAX updates donate the live cache buffers. Addressing is
-per native cache group; null/evicted pages must be omitted, not renumbered.
+submission excluded: JAX updates donate the live cache buffers, and the TPU
+Ray executor's compiled graph cannot tolerate other worker calls while a step
+is in flight. Each paused RPC does only device-side work (gather or scatter)
+and hands the device-to-host copy, object-store transfer and host-to-device
+upload to a worker background thread, which reports completion straight to
+the engine actor. Both engines keep stepping during that host work.
+Addressing is per native cache group; null/evicted pages must be omitted, not
+renumbered.
 
 Supported arrays are the installed RPA five-dimensional, unquantized attention
 layout, with only the packed-head axis partitioned. Native Gemma4 contiguous KV
-head replication can be converted after validating every source replica. Other
-TP-dependent packing changes, MLA, Mamba and context/data sharding are rejected.
+head replicas are proven byte-identical on the source devices, and only one
+canonical copy of every original head crosses the host. Each destination
+worker fetches only the canonical heads its own devices hold and repeats them
+into its local shards. Other TP-dependent packing changes, MLA, Mamba and
+context/data sharding are rejected.
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any
+from typing import Any, Optional
 
-FORMAT = "tpu-rpa-host-pages-v1"
+FORMAT = "tpu-rpa-host-pieces-v2"
+DEFAULT_STAGE_BYTES_PER_DEVICE = 64 << 20
 
 
 def _indices(index: Any, shape: Any) -> list[list[int]]:
@@ -90,28 +100,6 @@ def _logical_groups(layout: dict) -> list[dict]:
             layers.append(row)
         groups.append({**group, "layers": layers})
     return groups
-
-
-def _canonical_pages(data: Any, descriptor: dict) -> Any:
-    """Unpack ordinary RPA heads and prove every native repeat is byte-identical."""
-    import numpy as np
-
-    semantics = descriptor.get("head_semantics")
-    if semantics is None:
-        return data
-    original = semantics["original_num_kv_heads"]
-    effective = semantics["effective_num_kv_heads"]
-    repeats = effective // original
-    heads = data.reshape(*data.shape[:2], effective, 2, data.shape[-1])
-    canonical = heads[:, :, ::repeats, :, :]
-    for offset in range(1, repeats):
-        replica = heads[:, :, offset::repeats, :, :]
-        if not np.array_equal(canonical.view(np.uint8), replica.view(np.uint8)):
-            raise ValueError(
-                f"native repeated KV heads disagree: array_index={descriptor["array_index"]}, "
-                f"original_heads={original}, effective_heads={effective}, replica_offset={offset}"
-            )
-    return canonical
 
 
 def cache_layout(runner: Any) -> dict[str, Any]:
@@ -245,111 +233,295 @@ def _scatter(sharding: Any) -> Any:
                    donate_argnums=(0,), out_shardings=sharding)
 
 
-def export_blocks(runner: Any, addressing: dict) -> dict:
-    """Gather only live pages; invalid tokens are zeroed before device-to-host."""
-    import time
+def _put(value: Any) -> Any:
+    import ray
+
+    return ray.put(value)
+
+
+def _fetch(notifier: Any, transaction_id: str, keys: list) -> list:
+    """Resolve pieces through a Ray actor call, never refs pickled into a worker RPC.
+
+    Worker RPCs travel over vLLM's shared-memory queue with plain pickle, which
+    drops ObjectRef ownership; refs returned by a Ray call are properly borrowed.
+    """
+    import ray
+
+    return ray.get(ray.get(notifier.omp_kv_refs.remote(transaction_id, keys)))
+
+
+def split_refs(payload: dict) -> tuple[dict, dict]:
+    """Replace every piece ref with an integer key; the caller keeps the refs."""
+    refs, arrays = {}, []
+    for row in payload["arrays"]:
+        pieces = []
+        for piece in row["pieces"]:
+            key = len(refs)
+            refs[key] = piece["ref"]
+            pieces.append({**{k: v for k, v in piece.items() if k != "ref"}, "key": key})
+        arrays.append({**row, "pieces": pieces})
+    return {**payload, "arrays": arrays}, refs
+
+
+def _geometry(descriptor: dict) -> dict:
+    """Canonical units of one physical array: original heads, or raw axis-2 rows."""
+    shape = descriptor["shape"]
+    semantics = descriptor.get("head_semantics")
+    if semantics is None:
+        return {"mode": "raw", "units": shape[2], "repeat": 1}
+    effective = semantics["effective_num_kv_heads"]
+    original = semantics["original_num_kv_heads"]
+    return {"mode": "heads", "units": original, "repeat": effective // original}
+
+
+def _heads(bounds: list[int], width: int) -> tuple[int, int]:
+    """Effective heads held by an axis-2 interval of packed (head, K/V) rows."""
+    start, stop = bounds[0] * width, bounds[1] * width
+    if start % 2 or stop % 2:
+        raise ValueError("KV shard boundary splits one head's packed K/V pair")
+    return start // 2, stop // 2
+
+
+def _per_device_bytes(sharding: Any, shape: tuple, itemsize: int) -> int:
+    size = itemsize
+    for extent in sharding.shard_shape(shape):
+        size *= int(extent)
+    return size
+
+
+@lru_cache(maxsize=32)
+def _replica_check(effective: int, repeat: int, dtype: str) -> Any:
+    """Bitwise proof, on device, that every native head replica is identical."""
     import jax
-    import numpy as np
+    import jax.numpy as jnp
 
-    started = time.perf_counter()
-    layout = cache_layout(runner)
-    groups = _validate_addressing(layout, addressing)
-    rows = []
-    total = 0
-    for descriptor, cache in zip(layout["arrays"], runner.kv_caches):
-        for gid in descriptor["group_ids"]:
-            group = groups[gid]
-            if not group["block_ids"]:
-                continue
-            base = np.asarray(group["logical_block_indices"], dtype=np.int32) * cache.shape[1]
-            valid = np.asarray(group["valid_token_ranges"], dtype=np.int32)
-            selected = _gather(cache.sharding)(cache, np.asarray(group["block_ids"], dtype=np.int32),
-                                                valid[:, 0] - base, valid[:, 1] - base)
-            chunks = []
-            for shard in selected.addressable_shards:
-                # Replicated shards are validated/deduplicated during assembly.
-                data = np.asarray(jax.device_get(shard.data))
-                total += data.nbytes
-                chunks.append({"index": _indices(shard.index, selected.shape), "data": data,
-                               "device_id": int(shard.device.id)})
-            rows.append({"array_index": descriptor["array_index"], "group_id": gid,
-                         "shape": list(selected.shape), "dtype": str(selected.dtype), "shards": chunks})
-    return {"format": FORMAT, "layout": layout, "addressing": addressing, "arrays": rows,
-            "bytes": int(total), "gather_s": time.perf_counter() - started}
+    bits = {2: jnp.uint16, 4: jnp.uint32}[jnp.dtype(dtype).itemsize]
+
+    def check(pages: Any) -> Any:
+        raw = jax.lax.bitcast_convert_type(pages, bits)
+        heads = raw.reshape(*raw.shape[:2], effective, 2, raw.shape[-1])
+        base = heads[:, :, 0::repeat]
+        same = jnp.bool_(True)
+        for offset in range(1, repeat):
+            same = same & jnp.all(heads[:, :, offset::repeat] == base)
+        return same
+
+    return jax.jit(check)
 
 
-def assemble_exports(exports: list[dict]) -> dict:
-    """Assemble by physical shard coordinates, never worker/process ordering."""
-    import numpy as np
-
-    if not exports or any(item["format"] != FORMAT for item in exports):
-        raise ValueError("missing or incompatible worker exports")
-    first = exports[0]
-    layout = first["layout"]
-    processes = [item["layout"]["process_index"] for item in exports]
-    if sorted(processes) != list(range(layout["process_count"])):
-        raise ValueError("expected exactly one export per native worker process")
-    for item in exports:
-        if item["addressing"] != first["addressing"] or item["layout"]["groups"] != layout["groups"]:
-            raise ValueError("workers disagree on native addressing/cache groups")
-        if item["layout"]["arrays"] != layout["arrays"]:
-            raise ValueError("workers disagree on physical cache structure")
-    keys = [(row["array_index"], row["group_id"]) for row in first["arrays"]]
-    rows = []
-    for item in exports:
-        if [(r["array_index"], r["group_id"]) for r in item["arrays"]] != keys:
-            raise ValueError("workers disagree on exported physical arrays")
-    for offset, key in enumerate(keys):
-        descriptor = first["arrays"][offset]
-        shape = descriptor["shape"]
-        chunks: dict[tuple[int, int], Any] = {}
-        for item in exports:
-            row = item["arrays"][offset]
-            if row["shape"] != shape or row["dtype"] != descriptor["dtype"]:
-                raise ValueError("workers disagree on exported shape/dtype")
-            for shard in row["shards"]:
-                bounds, data = shard["index"], np.asarray(shard["data"])
-                if any(bounds[a] != [0, shape[a]] for a in (0, 1, 3, 4)):
-                    raise ValueError("export contains unsupported shard partitioning")
-                if list(data.shape) != [b - a for a, b in bounds] or str(data.dtype) != row["dtype"]:
-                    raise ValueError("shard data disagrees with its physical descriptor")
-                interval = tuple(bounds[2])
-                if interval in chunks and not np.array_equal(
-                    chunks[interval].view(np.uint8), data.view(np.uint8)
-                ):
-                    raise ValueError("replicated KV shards disagree")
-                chunks[interval] = data
-        cursor = 0
-        for start, stop in sorted(chunks):
-            if start != cursor or stop <= start:
-                raise ValueError("KV shard coverage has a gap or overlap")
-            cursor = stop
-        if cursor != shape[2]:
-            raise ValueError("KV shards do not cover the physical packed-head axis")
-        data = next(iter(chunks.values()))
-        if len(chunks) > 1:
-            data = np.empty(shape, dtype=data.dtype)
-            for (start, stop), chunk in chunks.items():
-                data[:, :, start:stop, :, :] = chunk
-        _canonical_pages(data, layout["arrays"][key[0]])
-        rows.append({"array_index": key[0], "group_id": key[1], "data": data})
-    return {"format": FORMAT, "layout": layout, "addressing": first["addressing"],
-            "arrays": rows, "bytes": sum(row["data"].nbytes for row in rows)}
+def _selected_rows(layout: dict, groups: dict) -> list[tuple[dict, int]]:
+    return [(descriptor, gid) for descriptor in layout["arrays"]
+            for gid in descriptor["group_ids"] if groups[gid]["block_ids"]]
 
 
-def import_blocks(runner: Any, addressing: dict, payload: dict) -> dict:
-    """Populate native-reserved pages, then wait for every device write to finish.
+def _executor(staging: dict) -> Any:
+    from concurrent.futures import ThreadPoolExecutor
 
-    Validation precedes donation. If execution itself fails, the caller must
-    fail/tear down the destination; it must not schedule from a partial import.
+    executor = staging.get("_executor")
+    if executor is None:
+        executor = staging["_executor"] = ThreadPoolExecutor(1, thread_name_prefix="omp-kv")
+    return executor
+
+
+def _notify(notifier: Any, transaction_id: str, message: dict) -> None:
+    """Tell the engine actor a background chunk finished; never a worker RPC."""
+    notifier.omp_kv_notify.remote(transaction_id, message)
+
+
+def _background(staging: dict, notifier: Any, transaction_id: str, process_index: int,
+                kind: str, chunk: int, job: Any) -> None:
+    """Every worker numbers chunks identically, since all receive the same RPC sequence."""
+    def run() -> None:
+        base = {"kind": kind, "process_index": process_index, "chunk": chunk}
+        try:
+            message = {**base, **job()}
+        except BaseException as exc:  # reported to the actor, which fails closed
+            message = {**base, "error": f"{type(exc).__name__}: {exc}"}
+        try:
+            _notify(notifier, transaction_id, message)
+        except BaseException as exc:  # the actor times out; keep the cause visible
+            import sys
+            print(f"omp-kv notify failed for {transaction_id}: {exc!r}", file=sys.stderr, flush=True)
+
+    _executor(staging).submit(run)
+
+
+def export_gather(runner: Any, staging: dict, transaction_id: str, addressing: dict,
+                  start: int, budget_bytes: int, notifier: Any) -> dict:
+    """Device-only step under the engine pause, then background host staging.
+
+    Gathers live pages of rows [start, next) into new device buffers, zeroes
+    tokens outside the valid range and proves head replicas equal on device.
+    The device-to-host copy and object-store publication run on a worker
+    background thread while the engine keeps stepping; completion is reported
+    to ``notifier`` (the engine actor), never polled through a worker RPC.
     """
     import time
-    import jax
     import numpy as np
 
     started = time.perf_counter()
     layout = cache_layout(runner)
     groups = _validate_addressing(layout, addressing)
+    rows = _selected_rows(layout, groups)
+    key = ("export", transaction_id)
+    if start == 0:
+        if key in staging:
+            raise RuntimeError("KV export already started for this transaction")
+        staging[key] = {"addressing": addressing, "cursor": 0, "chunks": 0}
+    record = staging.get(key)
+    if record is None or record["addressing"] != addressing or record["cursor"] != start:
+        raise ValueError("export chunk disagrees with this transaction's addressing/cursor")
+    cursor, used = start, 0
+    gathered = []
+    while cursor < len(rows):
+        descriptor, gid = rows[cursor]
+        cache = runner.kv_caches[descriptor["array_index"]]
+        group = groups[gid]
+        shape = (len(group["block_ids"]), *cache.shape[1:])
+        size = _per_device_bytes(cache.sharding, shape, cache.dtype.itemsize)
+        if gathered and used + size > budget_bytes:
+            break
+        base = np.asarray(group["logical_block_indices"], dtype=np.int32) * cache.shape[1]
+        valid = np.asarray(group["valid_token_ranges"], dtype=np.int32)
+        selected = _gather(cache.sharding)(cache, np.asarray(group["block_ids"], dtype=np.int32),
+                                           valid[:, 0] - base, valid[:, 1] - base)
+        geometry = _geometry(descriptor)
+        same = None
+        if geometry["mode"] == "heads" and geometry["repeat"] > 1:
+            semantics = descriptor["head_semantics"]
+            same = _replica_check(semantics["effective_num_kv_heads"], geometry["repeat"],
+                                  str(cache.dtype))(selected)
+        gathered.append({"descriptor": descriptor, "group_id": gid, "selected": selected,
+                         "replicas_equal": same})
+        used += size
+        cursor += 1
+    for row in gathered:
+        row["selected"].block_until_ready()
+        if row["replicas_equal"] is not None:
+            row["replicas_equal"].block_until_ready()
+    record["cursor"] = cursor
+    chunk = record["chunks"]
+    record["chunks"] += 1
+    if cursor >= len(rows):
+        staging.pop(key, None)
+    _background(staging, notifier, transaction_id, layout["process_index"], "export", chunk,
+                lambda: _stage_export(gathered))
+    return {"process_index": layout["process_index"], "next": cursor, "total": len(rows),
+            "rows_gathered": len(gathered), "device_bytes": used,
+            "gather_s": time.perf_counter() - started,
+            "layout": layout if start == 0 else None}
+
+
+def _stage_export(rows: list) -> dict:
+    """Background: copy one canonical replica of the gathered chunk to the host."""
+    import time
+    import jax
+    import numpy as np
+
+    started = time.perf_counter()
+    wanted = []  # (row, units, pick, shard); units None marks a pure-replica twin
+    twins = []   # (position of twin in wanted, position of first copy in wanted)
+    for row in rows:
+        descriptor = row["descriptor"]
+        if row["replicas_equal"] is not None and not bool(row["replicas_equal"]):
+            raise ValueError(
+                f"native repeated KV heads disagree: array_index={descriptor['array_index']}")
+        selected = row["selected"]
+        geometry = _geometry(descriptor)
+        seen: dict[tuple[int, int], int] = {}
+        for shard in selected.addressable_shards:
+            bounds = _indices(shard.index, selected.shape)
+            if any(bounds[a] != [0, selected.shape[a]] for a in (0, 1, 3, 4)):
+                raise ValueError("export contains unsupported shard partitioning")
+            interval = tuple(bounds[2])
+            if interval in seen:
+                # Pure replication across devices: copy both and compare bytes.
+                twins.append((len(wanted), seen[interval]))
+                wanted.append((row, None, None, shard))
+                continue
+            if geometry["mode"] == "heads":
+                first, stop = _heads(bounds[2], selected.shape[3])
+                repeat = geometry["repeat"]
+                offset = (-first) % repeat
+                if first + offset >= stop:
+                    continue
+                units = [(first + offset) // repeat, (stop - 1) // repeat + 1]
+                pick = (offset, repeat, stop - first)
+            else:
+                units, pick = list(bounds[2]), None
+            seen[interval] = len(wanted)
+            wanted.append((row, units, pick, shard))
+    host = [np.asarray(data) for data in jax.device_get([item[3].data for item in wanted])]
+    copied_s = time.perf_counter() - started
+    rows.clear()  # release the gathered device buffers
+    for twin, original in twins:
+        if not np.array_equal(host[twin].view(np.uint8), host[original].view(np.uint8)):
+            raise ValueError("replicated KV shards disagree")
+    pieces, total = [], 0
+    for (row, units, pick, _), data in zip(wanted, host):
+        if units is None:
+            continue
+        if pick is not None:
+            offset, repeat, count = pick
+            data = data.reshape(*data.shape[:2], count, 2, data.shape[-1])[:, :, offset::repeat]
+        piece = np.ascontiguousarray(data)
+        if piece.shape[2] != units[1] - units[0]:
+            raise ValueError("canonical KV piece disagrees with its unit range")
+        total += piece.nbytes
+        pieces.append({"array_index": row["descriptor"]["array_index"],
+                       "group_id": row["group_id"], "units": units,
+                       "shape": list(piece.shape), "dtype": str(piece.dtype),
+                       "nbytes": int(piece.nbytes), "ref": _put(piece)})
+    return {"pieces": pieces, "bytes": int(total), "d2h_s": copied_s,
+            "stage_s": time.perf_counter() - started}
+
+
+def discard(staging: dict, transaction_id: str) -> None:
+    staging.pop(("export", transaction_id), None)
+    staging.pop(("import", transaction_id), None)
+
+
+def assemble_manifest(layouts: list[dict], addressing: dict, stages: list[dict]) -> dict:
+    """Assemble piece coverage by canonical unit, never worker/process ordering."""
+    if not layouts:
+        raise ValueError("missing worker exports")
+    layout = layouts[0]
+    processes = [item["process_index"] for item in layouts]
+    if sorted(processes) != list(range(layout["process_count"])):
+        raise ValueError("expected exactly one export per native worker process")
+    for item in layouts:
+        if item["groups"] != layout["groups"] or item["arrays"] != layout["arrays"]:
+            raise ValueError("workers disagree on native cache groups/physical structure")
+    groups = _validate_addressing(layout, addressing)
+    rows = {(d["array_index"], gid): {"array_index": d["array_index"], "group_id": gid,
+                                      "blocks": len(groups[gid]["block_ids"]), "pieces": []}
+            for d, gid in _selected_rows(layout, groups)}
+    for stage in stages:
+        for piece in stage["pieces"]:
+            key = (piece["array_index"], piece["group_id"])
+            if key not in rows:
+                raise ValueError("export contains an unexpected KV array")
+            if piece["shape"][0] != rows[key]["blocks"]:
+                raise ValueError("export piece page count disagrees with addressing")
+            rows[key]["pieces"].append(piece)
+    total = 0
+    for (index, _), row in rows.items():
+        units = _geometry(layout["arrays"][index])["units"]
+        cursor = 0
+        row["pieces"].sort(key=lambda piece: piece["units"])
+        for piece in row["pieces"]:
+            start, stop = piece["units"]
+            if start != cursor or stop <= start:
+                raise ValueError("KV piece coverage has a gap or overlap")
+            cursor = stop
+            total += piece["nbytes"]
+        if cursor != units:
+            raise ValueError("KV pieces do not cover every canonical unit")
+    return {"format": FORMAT, "layout": layout, "addressing": addressing,
+            "arrays": list(rows.values()), "bytes": int(total)}
+
+
+def _validate_import(layout: dict, groups: dict, addressing: dict, payload: dict) -> None:
     if payload["format"] != FORMAT or _logical_groups(payload["layout"]) != _logical_groups(layout):
         raise ValueError("source/destination native cache groups differ")
     source_groups = _validate_addressing(payload["layout"], payload["addressing"])
@@ -374,44 +546,170 @@ def import_blocks(runner: Any, addressing: dict, payload: dict) -> dict:
                 raise ValueError("source/destination native head semantics differ")
             if any(source["shape"][axis] != destination["shape"][axis] for axis in (1, 3, 4)):
                 raise ValueError("native head repetition cannot change page/packing/head dimensions")
-        elif source["shape"][1:] != destination["shape"][1:]:
+        elif (source_semantics is None) != (destination_semantics is None) or \
+                source["shape"][1:] != destination["shape"][1:]:
             raise ValueError("source/destination physical layout differs; no proven native head mapping")
-    expected = {(a["array_index"], gid) for a in layout["arrays"] for gid in a["group_ids"]
-                if groups[gid]["block_ids"]}
+    expected = {(d["array_index"], gid) for d, gid in _selected_rows(layout, groups)}
     received = [(row["array_index"], row["group_id"]) for row in payload["arrays"]]
     if len(received) != len(expected) or set(received) != expected:
         raise ValueError("missing/duplicate/unexpected KV payload array")
-    prepared = []
-    conversions = []
-    for row in payload["arrays"]:
-        index, gid = row["array_index"], row["group_id"]
-        cache = runner.kv_caches[index]
-        source = source_arrays[index]
-        destination = layout["arrays"][index]
-        data = np.asarray(row["data"])
-        if data.shape != (len(groups[gid]["block_ids"]), *source["shape"][1:]) or data.dtype != cache.dtype:
-            raise ValueError("KV payload shape/dtype differs from declared native source")
-        canonical = _canonical_pages(data, source)
-        if source["shape"][1:] != destination["shape"][1:]:
-            semantics = destination["head_semantics"]
-            factor = semantics["effective_num_kv_heads"] // semantics["original_num_kv_heads"]
-            data = np.repeat(canonical, factor, axis=2).reshape(
-                len(groups[gid]["block_ids"]), *cache.shape[1:])
-            conversions.append({"array_index": index, "group_id": gid,
-                                "original_heads": semantics["original_num_kv_heads"],
-                                "source_effective_heads": source["head_semantics"]["effective_num_kv_heads"],
-                                "destination_effective_heads": semantics["effective_num_kv_heads"],
-                                "source_replicas_byte_equal": True})
-        prepared.append((index, gid, data))
-    total = 0
-    for index, gid, data in prepared:
-        cache = runner.kv_caches[index]
-        updates = jax.make_array_from_callback(data.shape, cache.sharding, lambda bounds: data[bounds])
-        indices = np.asarray(groups[gid]["block_ids"], dtype=np.int32)
-        updated = _scatter(cache.sharding)(cache, indices, updates)
-        runner.kv_caches[index] = updated
-        updated.block_until_ready()
-        total += sum(int(shard.data.nbytes) for shard in updates.addressable_shards)
-    return {"process_index": layout["process_index"], "arrays_written": len(prepared),
-            "bytes": total, "head_conversions": conversions,
-            "scatter_s": time.perf_counter() - started}
+
+
+def import_advance(runner: Any, staging: dict, transaction_id: str, *, commit: bool,
+                   start: int, budget_bytes: int, notifier: Any,
+                   addressing: Optional[dict] = None, payload: Optional[dict] = None) -> dict:
+    """One paused step of a pipelined import; the caller holds the engine drained.
+
+    If ``commit``, scatter the oldest fully staged chunk into the reserved pages.
+    Then, while fewer than two chunks are staging, plan the next chunk and hand
+    its fetch, head repeat and host-to-device upload to the worker background
+    thread, which reports completion to ``notifier``. The live cache is only
+    read or written here, never in the background.
+
+    If scatter execution itself fails, the caller must fail/tear down the
+    destination; it must not schedule from a partial import.
+    """
+    import time
+    from collections import deque
+
+    started = time.perf_counter()
+    layout = cache_layout(runner)
+    key = ("import", transaction_id)
+    if payload is not None:
+        if start != 0 or key in staging:
+            raise RuntimeError("KV import already started for this transaction")
+        groups = _validate_addressing(layout, addressing)
+        _validate_import(layout, groups, addressing, payload)
+        if any("ref" in piece for row in payload["arrays"] for piece in row["pieces"]):
+            raise ValueError("strip ObjectRefs with split_refs before a worker RPC")
+        staging[key] = {"payload": payload, "groups": groups, "cursor": 0,
+                        "pending": 0, "ready": deque(), "chunks": 0, "notifier": notifier,
+                        "transaction_id": transaction_id}
+    record = staging.get(key)
+    if record is None or record["cursor"] != start:
+        raise ValueError("import chunk disagrees with this transaction's cursor")
+    committed = None
+    if commit:
+        if record.get("error"):
+            raise RuntimeError(f"background KV staging failed: {record['error']}")
+        if not record["ready"]:
+            raise RuntimeError("no staged KV import chunk is ready to commit")
+        uploads = record["ready"].popleft()
+        record["pending"] -= 1
+        scatter = time.perf_counter()
+        written = []
+        for row in uploads:
+            index = row["array_index"]
+            cache = runner.kv_caches[index]
+            updated = _scatter(cache.sharding)(cache, row["block_ids"], row["updates"])
+            runner.kv_caches[index] = updated
+            written.append(updated)
+        for updated in written:
+            updated.block_until_ready()
+        committed = {"arrays_written": len(uploads), "scatter_s": time.perf_counter() - scatter}
+    arrays = record["payload"]["arrays"]
+    cursor = start
+    submitted = False
+    if cursor < len(arrays) and record["pending"] < 2:
+        used, plans = 0, []
+        while cursor < len(arrays):
+            row = arrays[cursor]
+            cache = runner.kv_caches[row["array_index"]]
+            shape = (len(record["groups"][row["group_id"]]["block_ids"]),
+                     *map(int, cache.shape[1:]))
+            size = _per_device_bytes(cache.sharding, shape, cache.dtype.itemsize)
+            if plans and used + size > budget_bytes:
+                break
+            plans.append({"row": row, "shape": shape, "sharding": cache.sharding,
+                          "dtype": str(cache.dtype),
+                          "destination": layout["arrays"][row["array_index"]]})
+            used += size
+            cursor += 1
+        record["cursor"] = cursor
+        record["pending"] += 1
+        submitted = True
+        chunk = record["chunks"]
+        record["chunks"] += 1
+        _background(staging, notifier, transaction_id, layout["process_index"], "import", chunk,
+                    lambda: _stage_import(record, plans))
+    if cursor >= len(arrays) and record["pending"] == 0 and not record["ready"]:
+        staging.pop(key, None)
+    return {"process_index": layout["process_index"], "next": cursor, "total": len(arrays),
+            "submitted": submitted, "committed": committed,
+            "advance_s": time.perf_counter() - started}
+
+
+def _stage_import(record: dict, plans: list) -> dict:
+    """Background: fetch only locally held canonical pieces and upload local shards."""
+    import time
+    import jax
+    import numpy as np
+
+    started = time.perf_counter()
+    try:
+        payload, groups = record["payload"], record["groups"]
+        record["progress"] = "planning"
+        needs, fetch = [], []
+        for plan in plans:
+            row, shape = plan["row"], plan["shape"]
+            geometry = _geometry(plan["destination"])
+            local = {}
+            for raw in plan["sharding"].addressable_devices_indices_map(shape).values():
+                bounds = tuple(_indices(raw, shape)[2])
+                if geometry["mode"] == "heads":
+                    first, stop = _heads(list(bounds), shape[3])
+                    local[bounds] = [head // geometry["repeat"] for head in range(first, stop)]
+                else:
+                    local[bounds] = list(range(*bounds))
+            needed = {unit for units in local.values() for unit in units}
+            chosen = [piece for piece in row["pieces"]
+                      if any(piece["units"][0] <= unit < piece["units"][1] for unit in needed)]
+            for piece in chosen:
+                if piece["dtype"] != plan["dtype"] or piece["shape"][0] != shape[0]:
+                    raise ValueError("KV payload shape/dtype differs from declared native source")
+            needs.append((plan, local, chosen))
+            fetch.extend(piece["key"] for piece in chosen)
+        record["progress"] = f"fetching {len(fetch)} pieces"
+        fetched = iter(_fetch(record["notifier"], record["transaction_id"], fetch) if fetch else [])
+        fetch_s = time.perf_counter() - started
+        record["progress"] = "uploading"
+        fetched_bytes, conversions, uploads = 0, [], []
+        for plan, local, chosen in needs:
+            row, shape = plan["row"], plan["shape"]
+            index, gid = row["array_index"], row["group_id"]
+            source = payload["layout"]["arrays"][index]
+            destination = plan["destination"]
+            canonical = {}
+            for piece in chosen:
+                data = np.asarray(next(fetched))
+                fetched_bytes += data.nbytes
+                for offset, unit in enumerate(range(*piece["units"])):
+                    canonical[unit] = data[:, :, offset]
+            slices = {}
+            for bounds, units in local.items():
+                parts = np.stack([canonical[unit] for unit in units], axis=2)
+                slices[bounds] = parts.reshape(shape[0], shape[1], bounds[1] - bounds[0], *shape[3:])
+            if source["shape"][1:] != destination["shape"][1:]:
+                semantics = destination["head_semantics"]
+                conversions.append({"array_index": index, "group_id": gid,
+                                    "original_heads": semantics["original_num_kv_heads"],
+                                    "source_effective_heads": source["head_semantics"]["effective_num_kv_heads"],
+                                    "destination_effective_heads": semantics["effective_num_kv_heads"],
+                                    "source_replicas_byte_equal": True})
+            updates = jax.make_array_from_callback(
+                shape, plan["sharding"],
+                lambda raw, slices=slices, shape=shape: slices[tuple(_indices(raw, shape)[2])])
+            uploads.append({"array_index": index, "group_id": gid, "updates": updates,
+                            "block_ids": np.asarray(groups[gid]["block_ids"], dtype=np.int32)})
+        record["progress"] = "awaiting device upload"
+        total = 0
+        for upload in uploads:
+            upload["updates"].block_until_ready()
+            total += sum(int(shard.data.nbytes) for shard in upload["updates"].addressable_shards)
+    except BaseException as exc:
+        record["error"] = f"{type(exc).__name__}: {exc}"
+        raise
+    record["ready"].append(uploads)
+    return {"arrays_staged": len(uploads), "fetched_bytes": int(fetched_bytes),
+            "bytes": int(total), "head_conversions": conversions, "fetch_s": fetch_s,
+            "stage_s": time.perf_counter() - started}
