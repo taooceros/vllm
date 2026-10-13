@@ -79,6 +79,11 @@ class EngineSettings:
     compilation_cache_dir: Optional[str] = None
     startup_compile_bundle: Optional[str] = None
     startup_device_trace: bool = False
+    # tpu-inference vision-encoder sharding: None keeps the backend default
+    # ("weights": encoder TP-sharded on the model axis); "data" replicates the
+    # encoder and shards images on the batch axis, required when encoder widths
+    # do not divide the TP size (Gemma-4's 4304 at TP32).
+    mm_encoder_tp_mode: Optional[str] = None
     # Extra process environment for the engine driver and every TPU worker.
     worker_env: Dict[str, str] = dataclasses.field(default_factory=dict)
     # Pre-spawned target engine (hetero/prespawn.py): CPU-only worker actors that park before the
@@ -106,6 +111,7 @@ class EngineSettings:
             ("activation_dtype", (None, "float32")),
             ("matmul_precision", ("default", "highest")),
             ("weight_snapshot", ("off", "write", "read")),
+            ("mm_encoder_tp_mode", (None, "weights", "data")),
         ):
             value = getattr(self, field)
             if value not in choices:
@@ -162,6 +168,18 @@ class EngineSettings:
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
+
+    def additional_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """vLLM ``additional_config`` consumed by tpu-inference and HeteroTPUWorker."""
+        config: Dict[str, Any] = {
+            "activation_dtype": self.activation_dtype,
+            "matmul_precision": self.matmul_precision,
+            "omp_hetero": payload,
+        }
+        if self.mm_encoder_tp_mode is not None:
+            # Key read by tpu_inference ShardingConfigManager.from_vllm_config.
+            config["mm-encoder-tp-mode"] = self.mm_encoder_tp_mode
+        return config
 
 
 @ray.remote
@@ -436,11 +454,7 @@ class HeteroEngine:
             distributed_executor_backend="ray",
             dtype=self.settings.dtype,
             kv_cache_dtype=self.settings.kv_cache_dtype,
-            additional_config={
-                "activation_dtype": self.settings.activation_dtype,
-                "matmul_precision": self.settings.matmul_precision,
-                "omp_hetero": payload,
-            },
+            additional_config=self.settings.additional_config(payload),
             max_model_len=self.settings.max_model_len,
             max_num_seqs=self.settings.max_num_seqs,
             max_num_batched_tokens=self.settings.max_num_batched_tokens,
