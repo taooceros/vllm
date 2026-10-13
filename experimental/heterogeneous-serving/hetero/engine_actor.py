@@ -34,8 +34,21 @@ EXTRA_ENV_VARS_TO_COPY = (
     "TPU_PROCESS_PORT",
     "JAX_PLATFORMS",
     "JAX_COMPILATION_CACHE_DIR",
+    "VLLM_XLA_CACHE_PATH",
     "OMP_HETERO_INSTANCE_ID",
 )
+
+
+# (activation_dtype, kv_cache_dtype, matmul_precision) combinations the native
+# backend serves.  Full bf16 state is the default: activations follow the bf16
+# model dtype (activation_dtype unset), bf16 KV, default matmul precision.  The
+# FP32-state profile (fp32 activations, fp32 KV, highest) stays selectable for
+# fp32 references.  Mixed q/KV dtypes are refused: the RPA v3 kernel has no
+# mixed-dtype matmul path (Mosaic: "Bad rhs type").
+NUMERIC_PROFILES = {
+    (None, "bfloat16", "default"): "bf16",
+    ("float32", "float32", "highest"): "fp32",
+}
 
 
 @dataclasses.dataclass
@@ -44,9 +57,10 @@ class EngineSettings:
 
     model: str = DEFAULT_MODEL
     dtype: str = "bfloat16"
-    kv_cache_dtype: str = "float32"
-    activation_dtype: str = "float32"
-    matmul_precision: str = "highest"
+    kv_cache_dtype: str = "bfloat16"
+    # None (unset): activations follow the model dtype.
+    activation_dtype: Optional[str] = None
+    matmul_precision: str = "default"
     backend_revision: str = BACKEND_REVISION
     runtime_revision: str = RUNTIME_REVISION
     max_model_len: int = 8192
@@ -56,17 +70,79 @@ class EngineSettings:
     enable_prefix_caching: bool = False
     enforce_eager: bool = False
     seed: int = 0
+    weight_snapshot: str = "off"
+    weight_snapshot_verify: bool = True
+    # Snapshot files live under <weight_snapshot_root>/<layout>/<instance>/rank<k>/. A first-switch
+    # (cold) run points it and exec_bank_dir at a per-run scope (hetero/run_scope.py).
+    weight_snapshot_root: str = "/dev/shm/omp_weights"
+    startup_profile: bool = False
+    compilation_cache_dir: Optional[str] = None
+    startup_compile_bundle: Optional[str] = None
+    startup_device_trace: bool = False
+    # Extra process environment for the engine driver and every TPU worker.
+    worker_env: Dict[str, str] = dataclasses.field(default_factory=dict)
+    # Pre-spawned target engine (hetero/prespawn.py): CPU-only worker actors that park before the
+    # first device touch until the switch controller releases their hosts.
+    prespawn: bool = False
+    # fast_graph traces the abstract model graph (restore builder and normal loader)
+    # under restore_graph.cheap_tracer_sharding_errors: a jax 0.10 O(N^2) workaround.
+    fast_graph: bool = False
+    # Executable bank (hetero/exec_bank.py): "write" serializes every precompiled bucket per
+    # worker into the pod-local exec_bank_dir; "read" loads it and skips trace/lower/compile.
+    exec_bank: Optional[str] = None
+    exec_bank_dir: str = "/root/.cache/omp_exec_bank"
+    # Gate test: this instance process rank refuses its bank, so every rank must fall back.
+    exec_bank_sabotage_rank: Optional[int] = None
+    # Parked-target pre-read (hetero/preread.py): with prespawn and weight_snapshot='read', each
+    # parked worker starts a CPU-only child that writes this rank's snapshot from the checkpoint
+    # before the release; the released worker waits for it (bounded) and restores from it.
+    preread: bool = False
+    preread_timeout_s: float = 900.0
 
     def __post_init__(self) -> None:
         for field, choices in (
             ("dtype", ("auto", "half", "float16", "bfloat16", "float", "float32")),
-            ("kv_cache_dtype", ("float32",)),
-            ("activation_dtype", ("float32",)),
-            ("matmul_precision", ("highest",)),
+            ("kv_cache_dtype", ("bfloat16", "float32")),
+            ("activation_dtype", (None, "float32")),
+            ("matmul_precision", ("default", "highest")),
+            ("weight_snapshot", ("off", "write", "read")),
         ):
             value = getattr(self, field)
             if value not in choices:
                 raise ValueError(f"unsupported {field} {value!r}; expected one of {choices}")
+        profile = (self.activation_dtype, self.kv_cache_dtype, self.matmul_precision)
+        if profile not in NUMERIC_PROFILES:
+            raise ValueError(
+                f"unsupported numeric profile (activation_dtype, kv_cache_dtype, matmul_precision)"
+                f"={profile!r}; expected one of {sorted(NUMERIC_PROFILES, key=str)}")
+        if self.activation_dtype is None and self.dtype in ("auto", "float32", "float"):
+            raise ValueError("unset activation_dtype requires an explicit 16-bit model dtype")
+        for field in ("weight_snapshot_verify", "startup_profile", "startup_device_trace",
+                      "fast_graph"):
+            if not isinstance(getattr(self, field), bool):
+                raise ValueError(f"{field} must be a boolean")
+        if not isinstance(self.prespawn, bool):
+            raise ValueError("prespawn must be a boolean")
+        if self.exec_bank not in (None, "write", "read"):
+            raise ValueError(f"unsupported exec_bank {self.exec_bank!r}; expected None, 'write' or 'read'")
+        for field in ("exec_bank_dir", "weight_snapshot_root"):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not os.path.isabs(value):
+                raise ValueError(f"{field} must be an absolute path")
+        if self.exec_bank is not None and self.enforce_eager:
+            raise ValueError("exec_bank requires precompilation (enforce_eager=False)")
+        if self.exec_bank_sabotage_rank is not None and (
+                self.exec_bank != "read" or isinstance(self.exec_bank_sabotage_rank, bool)
+                or not isinstance(self.exec_bank_sabotage_rank, int)
+                or self.exec_bank_sabotage_rank < 0):
+            raise ValueError("exec_bank_sabotage_rank must be a process rank >= 0 with exec_bank='read'")
+        if not isinstance(self.preread, bool):
+            raise ValueError("preread must be a boolean")
+        if self.preread and not (self.prespawn and self.weight_snapshot == "read"):
+            raise ValueError("preread requires prespawn=True and weight_snapshot='read'")
+        if (isinstance(self.preread_timeout_s, bool) or not isinstance(self.preread_timeout_s, (int, float))
+                or not self.preread_timeout_s > 0):
+            raise ValueError("preread_timeout_s must be a positive number")
         if self.backend_revision != BACKEND_REVISION:
             raise ValueError(
                 f"backend_revision {self.backend_revision!r} does not match "
@@ -121,6 +197,7 @@ class HeteroEngine:
         self._pg_name: Optional[str] = None
         self._endpoint = None
         self._heartbeat_task = None
+        self._prespawn_gate: Optional[Dict[str, Any]] = None
         self.endpoint_port: Optional[int] = None
         self._quiesced: Dict[str, str] = {}
 
@@ -205,6 +282,31 @@ class HeteroEngine:
             "state": self.state,
         }
 
+    def adopt_identity(
+        self, layout_id: str, layout_digest: str, instance: Optional[Dict[str, Any]] = None,
+        *, dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Keep serving, but report membership of another layout (partial reconfiguration).
+
+        The engine, placement group, generation and endpoint are untouched; only
+        the layout identity reported by identity()/the metrics labels changes.
+        ``instance`` is the target layout's resolved placement for this instance
+        and must name exactly the chips and hosts this engine already occupies.
+        """
+        if self.state != "ready" or self._draining:
+            raise RuntimeError(f"cannot adopt a layout identity while {self.state}")
+        if instance is not None:
+            def placement(body: Dict[str, Any]) -> Any:
+                return (body["instance_id"], body["tp_size"], list(body["host_ips"]),
+                        [(h["node_ip"], [list(c) for c in h["chip_coords"]]) for h in body["hosts"]])
+            if placement(instance) != placement(self.instance):
+                raise RuntimeError(
+                    f"{self.instance_id} does not occupy the same chips under layout {layout_id}")
+        if not dry_run:
+            self.layout_id = layout_id
+            self.layout_digest = layout_digest
+        return self.identity()
+
     def _model_build(self) -> str:
         return json.dumps({
             "vllm": _vllm_version(),
@@ -244,9 +346,16 @@ class HeteroEngine:
     def prepare_environment(self) -> Dict[str, Any]:
         """Applies this instance's runtime environment to the driver process."""
         intended = dict(self.instance["intended_runtime_env"])
+        intended.update(self.settings.worker_env)
+        self.instance["intended_runtime_env"].update(self.settings.worker_env)
+        if self.settings.compilation_cache_dir:
+            for key in ("JAX_COMPILATION_CACHE_DIR", "VLLM_XLA_CACHE_PATH"):
+                intended[key] = self.settings.compilation_cache_dir
+                self.instance["intended_runtime_env"][key] = self.settings.compilation_cache_dir
         intended.update(self.REQUIRED_ENV)
         existing = os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
-        merged = sorted(set(filter(None, existing.split(","))) | set(EXTRA_ENV_VARS_TO_COPY))
+        merged = sorted(set(filter(None, existing.split(","))) | set(EXTRA_ENV_VARS_TO_COPY)
+                        | set(self.settings.worker_env))
         intended["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(merged)
         for key, value in intended.items():
             os.environ[key] = value
@@ -282,12 +391,33 @@ class HeteroEngine:
             "matmul_precision": self.settings.matmul_precision,
             "backend_revision": self.settings.backend_revision,
             "runtime_revision": self.settings.runtime_revision,
+            "weight_snapshot": self.settings.weight_snapshot,
+            "weight_snapshot_verify": self.settings.weight_snapshot_verify,
+            "weight_snapshot_root": self.settings.weight_snapshot_root,
+            "startup_profile": self.settings.startup_profile,
+            "startup_compile_bundle": self.settings.startup_compile_bundle,
+            "startup_device_trace": self.settings.startup_device_trace,
+            **({"prespawn_gate": self._prespawn_gate} if self._prespawn_gate else {}),
+            "weight_snapshot_generation": self.__dict__.setdefault(
+                "_weight_snapshot_generation", uuid.uuid4().hex),
+            "fast_graph": self.settings.fast_graph,
+            "exec_bank": self.settings.exec_bank,
+            "exec_bank_dir": self.settings.exec_bank_dir,
+            "exec_bank_sabotage_rank": self.settings.exec_bank_sabotage_rank,
+            "preread": self.settings.preread,
+            "preread_timeout_s": float(self.settings.preread_timeout_s),
+            # Fresh per initialize(): unanimity votes of an earlier attempt are never read.
+            "exec_bank_nonce": uuid.uuid4().hex,
         }
 
-    async def initialize(self, *, pg_name: str, timeout_s: float = 3600.0) -> Dict[str, Any]:
+    async def initialize(self, *, pg_name: str, timeout_s: float = 3600.0,
+                         prespawn_gate: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Builds the vLLM engine bound to this instance's owned placement group."""
         if self.engine is not None:
             return {"status": "already_initialized", **self._init_evidence}
+        if bool(prespawn_gate) != self.settings.prespawn:
+            raise RuntimeError("engine setting prespawn and the presence of a release gate disagree")
+        self._prespawn_gate = dict(prespawn_gate) if prespawn_gate else None
 
         from ray.util.placement_group import get_placement_group
         from vllm.engine.arg_utils import EngineArgs
@@ -331,7 +461,7 @@ class HeteroEngine:
             **_supported_kwargs(
                 LLMEngine.__init__,
                 vllm_config=vllm_config,
-                executor_class=_executor_class(vllm_config),
+                executor_class=_executor_class(vllm_config, prespawn=self.settings.prespawn),
                 log_stats=True,
                 multiprocess_mode=False,
             )
@@ -351,6 +481,8 @@ class HeteroEngine:
             "resolved_engine_config": self._config_evidence(vllm_config),
             "kv_capacity": self.kv_capacity(),
             "worker_evidence": self.worker_evidence(),
+            "engine_init_started_at": started,
+            "worker_init_phases": self.engine_core.model_executor.collective_rpc("omp_init_phases"),
         }
         return self._init_evidence
 
@@ -404,6 +536,22 @@ class HeteroEngine:
 
     def worker_evidence(self) -> List[Dict[str, Any]]:
         return self.engine_core.model_executor.collective_rpc("omp_worker_evidence")
+
+    def worker_init_phases(self) -> List[Dict[str, Any]]:
+        return self.engine_core.model_executor.collective_rpc("omp_init_phases")
+
+    def snapshot_weights(self) -> List[Dict[str, Any]]:
+        """Explicitly publish every worker's final, device-resident runner state."""
+        if self.state != "ready" or self._inflight:
+            raise RuntimeError("snapshot requires a ready, idle engine")
+        return self.engine_core.model_executor.collective_rpc(
+            "omp_snapshot_weights", args=(uuid.uuid4().hex,))
+
+    def weight_fingerprint(self) -> List[Dict[str, Any]]:
+        """Validation-only byte digests of live weights, outside snapshot timing."""
+        if self.state != "ready" or self._inflight:
+            raise RuntimeError("weight fingerprint requires a ready, idle engine")
+        return self.engine_core.model_executor.collective_rpc("omp_weight_fingerprint")
 
     def worker_kv_evidence(self) -> List[Dict[str, Any]]:
         return self.engine_core.model_executor.collective_rpc("omp_kv_cache_evidence")
@@ -863,6 +1011,9 @@ class HeteroEngine:
         keys = ("transaction_id", "request_id", "destination_epoch", "destination_generation",
                 "max_context_tokens", "mechanism", "source_instance", "source_generation", "source_epoch")
         identity = {key: payload[key] for key in keys}
+        # Pages to hold now; defaults to the full final context. Length-blind
+        # policies pass current context plus a growth allowance instead.
+        identity["reserve_tokens"] = int(payload.get("reserve_tokens") or payload["max_context_tokens"])
         identity["destination_instance"] = self.instance_id
         txn = identity["transaction_id"]
         async with self._transaction_lock(txn):
@@ -885,6 +1036,8 @@ class HeteroEngine:
                 reasons.append("unsupported_mechanism")
             if not 0 < identity["max_context_tokens"] <= self.settings.max_model_len:
                 reasons.append("invalid_max_context_tokens")
+            if not 0 < identity["reserve_tokens"] <= identity["max_context_tokens"]:
+                reasons.append("invalid_reserve_tokens")
             count = 0
             if not reasons:
                 try:
@@ -953,6 +1106,10 @@ class HeteroEngine:
                 reasons.append("invalid_remaining_generation_budget")
             if len(prompt) + int(sampling["max_tokens"]) != identity["max_context_tokens"]:
                 reasons.append("snapshot_exceeds_or_disagrees_with_reserved_growth")
+            if context + 1 > identity["reserve_tokens"]:
+                # Length-blind reservations hold only a growth allowance; the
+                # snapshot outgrew it, so abort and let the source resume.
+                reasons.append("snapshot_exceeds_reserved_pages")
             computed = int(payload["num_computed_tokens"]) if identity["mechanism"] == "kv_host" else 0
             evidence: Dict[str, Any] = {}
             if not reasons:
@@ -1552,10 +1709,15 @@ class HeteroEngine:
 
 
 
-def _executor_class(vllm_config: Any) -> Any:
+def _executor_class(vllm_config: Any, *, prespawn: bool = False) -> Any:
     from vllm.v1.executor.abstract import Executor
 
-    return Executor.get_class(vllm_config)
+    executor = Executor.get_class(vllm_config)
+    if prespawn:
+        from .prespawn import prespawn_executor_class
+
+        executor = prespawn_executor_class(executor)
+    return executor
 
 
 def _supported_kwargs(fn: Any, **kwargs: Any) -> Dict[str, Any]:
