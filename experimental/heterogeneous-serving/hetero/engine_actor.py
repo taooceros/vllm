@@ -78,9 +78,18 @@ class EngineSettings:
     startup_device_trace: bool = False
     # Extra process environment for the engine driver and every TPU worker.
     worker_env: Dict[str, str] = dataclasses.field(default_factory=dict)
+    # Pre-spawned target engine (hetero/prespawn.py): CPU-only worker actors that park before the
+    # first device touch until the switch controller releases their hosts.
+    prespawn: bool = False
     # fast_graph traces the abstract model graph (restore builder and normal loader)
     # under restore_graph.cheap_tracer_sharding_errors: a jax 0.10 O(N^2) workaround.
     fast_graph: bool = False
+    # Executable bank (hetero/exec_bank.py): "write" serializes every precompiled bucket per
+    # worker into the pod-local exec_bank_dir; "read" loads it and skips trace/lower/compile.
+    exec_bank: Optional[str] = None
+    exec_bank_dir: str = "/root/.cache/omp_exec_bank"
+    # Gate test: this instance process rank refuses its bank, so every rank must fall back.
+    exec_bank_sabotage_rank: Optional[int] = None
 
     def __post_init__(self) -> None:
         for field, choices in (
@@ -104,6 +113,19 @@ class EngineSettings:
                       "fast_graph"):
             if not isinstance(getattr(self, field), bool):
                 raise ValueError(f"{field} must be a boolean")
+        if not isinstance(self.prespawn, bool):
+            raise ValueError("prespawn must be a boolean")
+        if self.exec_bank not in (None, "write", "read"):
+            raise ValueError(f"unsupported exec_bank {self.exec_bank!r}; expected None, 'write' or 'read'")
+        if not isinstance(self.exec_bank_dir, str) or not os.path.isabs(self.exec_bank_dir):
+            raise ValueError("exec_bank_dir must be an absolute path")
+        if self.exec_bank is not None and self.enforce_eager:
+            raise ValueError("exec_bank requires precompilation (enforce_eager=False)")
+        if self.exec_bank_sabotage_rank is not None and (
+                self.exec_bank != "read" or isinstance(self.exec_bank_sabotage_rank, bool)
+                or not isinstance(self.exec_bank_sabotage_rank, int)
+                or self.exec_bank_sabotage_rank < 0):
+            raise ValueError("exec_bank_sabotage_rank must be a process rank >= 0 with exec_bank='read'")
         if self.backend_revision != BACKEND_REVISION:
             raise ValueError(
                 f"backend_revision {self.backend_revision!r} does not match "
@@ -158,6 +180,7 @@ class HeteroEngine:
         self._pg_name: Optional[str] = None
         self._endpoint = None
         self._heartbeat_task = None
+        self._prespawn_gate: Optional[Dict[str, Any]] = None
         self.endpoint_port: Optional[int] = None
         self._quiesced: Dict[str, str] = {}
 
@@ -356,15 +379,25 @@ class HeteroEngine:
             "startup_profile": self.settings.startup_profile,
             "startup_compile_bundle": self.settings.startup_compile_bundle,
             "startup_device_trace": self.settings.startup_device_trace,
+            **({"prespawn_gate": self._prespawn_gate} if self._prespawn_gate else {}),
             "weight_snapshot_generation": self.__dict__.setdefault(
                 "_weight_snapshot_generation", uuid.uuid4().hex),
             "fast_graph": self.settings.fast_graph,
+            "exec_bank": self.settings.exec_bank,
+            "exec_bank_dir": self.settings.exec_bank_dir,
+            "exec_bank_sabotage_rank": self.settings.exec_bank_sabotage_rank,
+            # Fresh per initialize(): unanimity votes of an earlier attempt are never read.
+            "exec_bank_nonce": uuid.uuid4().hex,
         }
 
-    async def initialize(self, *, pg_name: str, timeout_s: float = 3600.0) -> Dict[str, Any]:
+    async def initialize(self, *, pg_name: str, timeout_s: float = 3600.0,
+                         prespawn_gate: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Builds the vLLM engine bound to this instance's owned placement group."""
         if self.engine is not None:
             return {"status": "already_initialized", **self._init_evidence}
+        if bool(prespawn_gate) != self.settings.prespawn:
+            raise RuntimeError("engine setting prespawn and the presence of a release gate disagree")
+        self._prespawn_gate = dict(prespawn_gate) if prespawn_gate else None
 
         from ray.util.placement_group import get_placement_group
         from vllm.engine.arg_utils import EngineArgs
@@ -408,7 +441,7 @@ class HeteroEngine:
             **_supported_kwargs(
                 LLMEngine.__init__,
                 vllm_config=vllm_config,
-                executor_class=_executor_class(vllm_config),
+                executor_class=_executor_class(vllm_config, prespawn=self.settings.prespawn),
                 log_stats=True,
                 multiprocess_mode=False,
             )
@@ -1656,10 +1689,15 @@ class HeteroEngine:
 
 
 
-def _executor_class(vllm_config: Any) -> Any:
+def _executor_class(vllm_config: Any, *, prespawn: bool = False) -> Any:
     from vllm.v1.executor.abstract import Executor
 
-    return Executor.get_class(vllm_config)
+    executor = Executor.get_class(vllm_config)
+    if prespawn:
+        from .prespawn import prespawn_executor_class
+
+        executor = prespawn_executor_class(executor)
+    return executor
 
 
 def _supported_kwargs(fn: Any, **kwargs: Any) -> Dict[str, Any]:
