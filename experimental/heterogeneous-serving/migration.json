@@ -46,8 +46,8 @@
     },
     {
       "path": "hetero/engine_actor.py",
-      "sha256": "714dcdf248afd5305cb1a0977b20443e8f4403e173fe226ee2be05584024fc44",
-      "bytes": 81222
+      "sha256": "03e3b3e9d5123f482eaf4bc3890ac453c6ef103a8db687cd052f33a75b2daaab",
+      "bytes": 83401
     },
     {
       "path": "hetero/inproc_engine.py",
@@ -61,13 +61,13 @@
     },
     {
       "path": "hetero/scheduler.py",
-      "sha256": "6e2aae6d68d1dc2af9d9348794f6cc145be61ace77fabb848f2b763930742979",
-      "bytes": 33444
+      "sha256": "2c3a3b28ebad52b9b0423fa040867c7990faba4be5848a3723bb8051ee784a9b",
+      "bytes": 33570
     },
     {
       "path": "hetero/serving_http.py",
-      "sha256": "0c2c6ca6f1654e2f6e2e2cdc74b378b2ea2d720e9a58cce7d99746f23d123bd3",
-      "bytes": 6757
+      "sha256": "964a8d55a1976e2ecce535eacfc2327d49ffc6193def70fc10db51fea58fcbac",
+      "bytes": 9188
     },
     {
       "path": "tests/test_kv_transport.py",

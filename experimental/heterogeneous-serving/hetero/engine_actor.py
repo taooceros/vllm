@@ -205,6 +205,31 @@ class HeteroEngine:
             "state": self.state,
         }
 
+    def adopt_identity(
+        self, layout_id: str, layout_digest: str, instance: Optional[Dict[str, Any]] = None,
+        *, dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Keep serving, but report membership of another layout (partial reconfiguration).
+
+        The engine, placement group, generation and endpoint are untouched; only
+        the layout identity reported by identity()/the metrics labels changes.
+        ``instance`` is the target layout's resolved placement for this instance
+        and must name exactly the chips and hosts this engine already occupies.
+        """
+        if self.state != "ready" or self._draining:
+            raise RuntimeError(f"cannot adopt a layout identity while {self.state}")
+        if instance is not None:
+            def placement(body: Dict[str, Any]) -> Any:
+                return (body["instance_id"], body["tp_size"], list(body["host_ips"]),
+                        [(h["node_ip"], [list(c) for c in h["chip_coords"]]) for h in body["hosts"]])
+            if placement(instance) != placement(self.instance):
+                raise RuntimeError(
+                    f"{self.instance_id} does not occupy the same chips under layout {layout_id}")
+        if not dry_run:
+            self.layout_id = layout_id
+            self.layout_digest = layout_digest
+        return self.identity()
+
     def _model_build(self) -> str:
         return json.dumps({
             "vllm": _vllm_version(),
@@ -351,6 +376,8 @@ class HeteroEngine:
             "resolved_engine_config": self._config_evidence(vllm_config),
             "kv_capacity": self.kv_capacity(),
             "worker_evidence": self.worker_evidence(),
+            "engine_init_started_at": started,
+            "worker_init_phases": self.engine_core.model_executor.collective_rpc("omp_init_phases"),
         }
         return self._init_evidence
 
@@ -863,6 +890,9 @@ class HeteroEngine:
         keys = ("transaction_id", "request_id", "destination_epoch", "destination_generation",
                 "max_context_tokens", "mechanism", "source_instance", "source_generation", "source_epoch")
         identity = {key: payload[key] for key in keys}
+        # Pages to hold now; defaults to the full final context. Length-blind
+        # policies pass current context plus a growth allowance instead.
+        identity["reserve_tokens"] = int(payload.get("reserve_tokens") or payload["max_context_tokens"])
         identity["destination_instance"] = self.instance_id
         txn = identity["transaction_id"]
         async with self._transaction_lock(txn):
@@ -885,6 +915,8 @@ class HeteroEngine:
                 reasons.append("unsupported_mechanism")
             if not 0 < identity["max_context_tokens"] <= self.settings.max_model_len:
                 reasons.append("invalid_max_context_tokens")
+            if not 0 < identity["reserve_tokens"] <= identity["max_context_tokens"]:
+                reasons.append("invalid_reserve_tokens")
             count = 0
             if not reasons:
                 try:
@@ -953,6 +985,10 @@ class HeteroEngine:
                 reasons.append("invalid_remaining_generation_budget")
             if len(prompt) + int(sampling["max_tokens"]) != identity["max_context_tokens"]:
                 reasons.append("snapshot_exceeds_or_disagrees_with_reserved_growth")
+            if context + 1 > identity["reserve_tokens"]:
+                # Length-blind reservations hold only a growth allowance; the
+                # snapshot outgrew it, so abort and let the source resume.
+                reasons.append("snapshot_exceeds_reserved_pages")
             computed = int(payload["num_computed_tokens"]) if identity["mechanism"] == "kv_host" else 0
             evidence: Dict[str, Any] = {}
             if not reasons:

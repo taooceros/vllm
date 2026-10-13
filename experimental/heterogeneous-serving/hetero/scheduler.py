@@ -92,7 +92,7 @@ class HeteroScheduler(AsyncScheduler):
             raise RuntimeError("request already reserved under another transaction")
         manager = self.kv_cache_manager
         native_id = f"{rid}#e{epoch}"
-        maximum = int(payload["max_context_tokens"])
+        maximum = int(payload.get("reserve_tokens") or payload["max_context_tokens"])
         count = manager.coordinator.get_num_blocks_to_allocate(
             request_id=native_id, num_tokens=maximum,
             new_computed_blocks=manager.empty_kv_cache_blocks.blocks,
@@ -119,7 +119,8 @@ class HeteroScheduler(AsyncScheduler):
         record["blocks"] = []
         try:
             allocated = manager.allocate_slots(
-                request, num_new_tokens=record["identity"]["max_context_tokens"],
+                request, num_new_tokens=int(record["identity"].get("reserve_tokens")
+                                            or record["identity"]["max_context_tokens"]),
                 delay_cache_blocks=True, has_scheduled_reqs=False,
             )
             if allocated is None:

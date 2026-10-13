@@ -6,6 +6,13 @@ its coordinator host.  Ray worker pods run with ``hostNetwork: true``, so
 (``GET :8000/health``) only passes once a real engine is serving.  That is what
 turns "a Ray worker node is alive" into "a model endpoint is ready", and it is
 what the gateway's pod-selector discovery resolves to a logical instance.
+
+The same surface is the llm-d EPP contract: ``/metrics`` carries the vLLM
+names the core metrics extractor reads plus ``omp:kv_*`` block facts, and
+``/v1/completions`` accepts the standard OpenAI ``prompt`` as one int array of
+token ids.  Each response choice also carries ``token_ids`` (the delivered
+output token ids, as vLLM's ``return_token_ids``) and an ``omp`` object with
+the serving instance, so a client behind Envoy can account every token exactly.
 """
 
 from __future__ import annotations
@@ -13,8 +20,14 @@ from __future__ import annotations
 import asyncio
 import time
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from typing import Any, Awaitable, Callable, Dict, Optional
+
+
+async def _client_disconnected(request: Request) -> None:
+    """Returns once the client connection is gone; the request body is already read."""
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
 
 
 def build_app(engine: Any) -> Any:
@@ -47,26 +60,59 @@ def build_app(engine: Any) -> Any:
     async def metrics() -> Any:
         return PlainTextResponse(_render_metrics(engine))
 
+    @app.get("/v1/models")
+    async def models() -> Any:
+        model = engine.settings.model
+        return {
+            "object": "list",
+            "data": [{
+                "id": model, "object": "model", "owned_by": "omp-hetero", "root": model,
+                "max_model_len": int(engine.settings.max_model_len),
+            }],
+        }
+
     @app.post("/v1/completions")
     async def completions(request: Request) -> Any:
         body = await request.json()
         prompt = body.get("prompt")
         prompt_token_ids = body.get("prompt_token_ids")
+        if isinstance(prompt, list):
+            # OpenAI allows a batch (list of strings/arrays); only one token array is served.
+            if prompt_token_ids is not None or not prompt or not all(
+                    isinstance(t, int) and not isinstance(t, bool) for t in prompt):
+                raise HTTPException(status_code=400,
+                                    detail="prompt must be a string or one int array of token ids")
+            prompt, prompt_token_ids = None, prompt
         if prompt is None and prompt_token_ids is None:
             raise HTTPException(status_code=400, detail="prompt or prompt_token_ids required")
         if body.get("stream"):
             raise HTTPException(status_code=400, detail="streaming is not supported")
         started = time.time()
+        generation = asyncio.ensure_future(engine.generate(
+            prompt=prompt,
+            prompt_token_ids=prompt_token_ids,
+            max_tokens=int(body.get("max_tokens", 16)),
+            temperature=float(body.get("temperature", 0.0)),
+            seed=body.get("seed"),
+            request_id=body.get("request_id"),
+            ignore_eos=bool(body.get("ignore_eos", False)),
+        ))
+        disconnect = asyncio.ensure_future(_client_disconnected(request))
         try:
-            result = await engine.generate(
-                prompt=prompt,
-                prompt_token_ids=prompt_token_ids,
-                max_tokens=int(body.get("max_tokens", 16)),
-                temperature=float(body.get("temperature", 0.0)),
-                seed=body.get("seed"),
-                request_id=body.get("request_id"),
-                ignore_eos=bool(body.get("ignore_eos", False)),
-            )
+            await asyncio.wait({generation, disconnect}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # Client gone (or this handler cancelled): cancelling the generate
+            # coroutine aborts the native request, as for any cancelled caller,
+            # so an abandoned request never keeps decoding on the device while
+            # the router has already released its charge.
+            disconnect.cancel()
+            if not generation.done():
+                generation.cancel()
+                await asyncio.gather(generation, return_exceptions=True)
+        if generation.cancelled():
+            return Response(status_code=499)
+        try:
+            result = generation.result()
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {
@@ -111,12 +157,14 @@ def _render_metrics(engine: Any) -> str:
         f"vllm:num_requests_running{labels} {status.get('num_running', 0)}",
         "# TYPE vllm:num_requests_waiting gauge",
         f"vllm:num_requests_waiting{labels} {status.get('num_waiting', 0)}",
-        "# TYPE vllm:gpu_cache_usage_perc gauge",
-        f"vllm:gpu_cache_usage_perc{labels} {usage:.6f}",
+        "# TYPE vllm:kv_cache_usage_perc gauge",
+        f"vllm:kv_cache_usage_perc{labels} {usage:.6f}",
         "# TYPE omp:kv_free_blocks gauge",
         f"omp:kv_free_blocks{labels} {free}",
         "# TYPE omp:kv_total_blocks gauge",
         f"omp:kv_total_blocks{labels} {total}",
+        "# TYPE omp:kv_block_size gauge",
+        f"omp:kv_block_size{labels} {int(status.get('block_size', 0))}",
         "# TYPE omp:inflight_requests gauge",
         f"omp:inflight_requests{labels} {status.get('inflight', 0)}",
         "# TYPE omp:served_requests counter",
