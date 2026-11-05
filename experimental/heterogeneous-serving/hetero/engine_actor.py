@@ -98,6 +98,9 @@ class EngineSettings:
     # before the release; the released worker waits for it (bounded) and restores from it.
     preread: bool = False
     preread_timeout_s: float = 900.0
+    # Autoscale boot overlap (hetero/state_delivery.py): > 0 makes every worker wait, right before its
+    # first device touch, for the concurrent fetch to publish its rank's startup state; 0 = off.
+    state_gate_timeout_s: float = 0.0
 
     def __post_init__(self) -> None:
         for field, choices in (
@@ -143,6 +146,11 @@ class EngineSettings:
         if (isinstance(self.preread_timeout_s, bool) or not isinstance(self.preread_timeout_s, (int, float))
                 or not self.preread_timeout_s > 0):
             raise ValueError("preread_timeout_s must be a positive number")
+        if (isinstance(self.state_gate_timeout_s, bool) or not isinstance(self.state_gate_timeout_s, (int, float))
+                or self.state_gate_timeout_s < 0):
+            raise ValueError("state_gate_timeout_s must be a number >= 0 (0 = off)")
+        if self.state_gate_timeout_s and self.prespawn:
+            raise ValueError("state_gate_timeout_s is for fresh-host boots; a pre-spawned engine waits on its release gate")
         if self.backend_revision != BACKEND_REVISION:
             raise ValueError(
                 f"backend_revision {self.backend_revision!r} does not match "
@@ -406,6 +414,7 @@ class HeteroEngine:
             "exec_bank_sabotage_rank": self.settings.exec_bank_sabotage_rank,
             "preread": self.settings.preread,
             "preread_timeout_s": float(self.settings.preread_timeout_s),
+            "state_gate_timeout_s": float(self.settings.state_gate_timeout_s),
             # Fresh per initialize(): unanimity votes of an earlier attempt are never read.
             "exec_bank_nonce": uuid.uuid4().hex,
         }
