@@ -1,0 +1,517 @@
+--- a/vllm/config/parallel.py
++++ b/vllm/config/parallel.py
+@@ -1050,9 +1050,17 @@
+                 " custom Executor subclass or its import path."
+             )
+         if self.use_ray:
+-            from vllm.v1.executor import ray_utils
++            from vllm.distributed.parallel_state import is_cpu_model_preparation
++
++            if is_cpu_model_preparation():
++                from importlib.util import find_spec
++
++                if find_spec("ray") is None:
++                    raise ValueError("Ray is required for the deferred executor.")
++            else:
++                from vllm.v1.executor import ray_utils
+ 
+-            ray_utils.assert_ray_available()
++                ray_utils.assert_ray_available()
+ 
+         if not current_platform.use_custom_allreduce():
+             self.disable_custom_all_reduce = True
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1220,8 +1220,17 @@
+         from vllm.v1.executor.abstract import Executor
+ 
+         executor_backend = self.parallel_config.distributed_executor_backend
+-        executor_class = Executor.get_class(self)
+-        executor_supports_async_sched = executor_class.supports_async_scheduling()
++        from vllm.distributed.parallel_state import is_cpu_model_preparation
++
++        if is_cpu_model_preparation():
++            executor_supports_async_sched = getattr(
++                self.parallel_config, "_pm_cpu_executor_supports_async", None
++            )
++            if type(executor_supports_async_sched) is not bool:
++                raise ValueError("CPU model preparation requires resolved executor metadata")
++        else:
++            executor_class = Executor.get_class(self)
++            executor_supports_async_sched = executor_class.supports_async_scheduling()
+         uses_rocm_deepep_ht_dbo = (
+             current_platform.is_rocm()
+             and self.parallel_config.enable_dbo
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -28,8 +28,9 @@
+ import pickle
+ import weakref
+ from collections import deque, namedtuple
+-from collections.abc import Callable
++from collections.abc import Callable, Iterator
+ from contextlib import contextmanager, nullcontext
++from contextvars import ContextVar
+ from dataclasses import dataclass
+ from datetime import timedelta
+ from multiprocessing import shared_memory
+@@ -447,6 +448,7 @@
+         group_name: str | None = None,
+         use_all2all: bool = False,
+     ):
++        _require_real_distributed_state("GroupCoordinator construction")
+         group_name = group_name or "anonymous"
+         self.unique_name = _get_unique_name(group_name)
+         _register_group(self)
+@@ -1479,6 +1481,7 @@
+     use_all2all: bool = False,
+ ) -> "StatelessGroupCoordinator":
+     """Create a StatelessGroupCoordinator with the given parameters."""
++    _require_real_distributed_state("stateless group construction")
+     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
+ 
+     world = get_world_group()
+@@ -1524,6 +1527,7 @@
+ 
+ 
+ def get_tp_group() -> GroupCoordinator:
++    _require_real_distributed_state("get_tp_group")
+     assert _TP is not None, "tensor model parallel group is not initialized"
+     return _TP
+ 
+@@ -1540,6 +1544,7 @@
+ 
+ 
+ def get_pp_group() -> GroupCoordinator:
++    _require_real_distributed_state("get_pp_group")
+     assert _PP is not None, "pipeline model parallel group is not initialized"
+     return _PP
+ 
+@@ -1584,6 +1589,84 @@
+     return _PCP
+ 
+ 
++@dataclass(frozen=True)
++class _CPUModelParallelGeometry:
++    tp_rank: int
++    tp_size: int
++    pp_rank: int
++    pp_size: int
++
++
++_cpu_model_parallel_geometry: ContextVar[_CPUModelParallelGeometry | None] = (
++    ContextVar("cpu_model_parallel_geometry", default=None)
++)
++
++
++def is_cpu_model_preparation() -> bool:
++    return _cpu_model_parallel_geometry.get() is not None
++
++
++def _require_real_distributed_state(operation: str) -> None:
++    if _cpu_model_parallel_geometry.get() is not None:
++        raise RuntimeError(
++            f"{operation} is unavailable inside cpu_model_parallel_geometry: "
++            "only static TP/PP scalar metadata queries are supported; "
++            "real groups, communication and native initialization are not."
++        )
++
++
++@contextmanager
++def cpu_model_parallel_geometry(
++    tp_rank: int,
++    tp_size: int,
++    pp_rank: int = 0,
++    pp_size: int = 1,
++) -> Iterator[None]:
++    """Supply static TP/PP metadata for CPU-only model construction.
++
++    This is not distributed initialization: no group is created or returned,
++    and model_parallel_is_initialized() remains false. Existing distributed
++    state and nested geometry contexts are rejected. State is context-local
++    and restored even when construction raises.
++
++    This context allocates no tensors and does not initialize any device. It
++    does not change tensor placement or sandbox arbitrary constructor code:
++    the caller must separately use torch.device("meta") and native/allocation
++    guards when constructing a storage-free model. Communication, execution,
++    and concurrent distributed initialization are outside this contract.
++    """
++    for name, rank, size in (
++        ("tp", tp_rank, tp_size),
++        ("pp", pp_rank, pp_size),
++    ):
++        if type(rank) is not int or type(size) is not int:
++            raise TypeError(f"{name}_rank and {name}_size must be integers")
++        if size < 1 or not 0 <= rank < size:
++            raise ValueError(f"require {name}_size >= 1 and 0 <= {name}_rank < size")
++    if _cpu_model_parallel_geometry.get() is not None:
++        raise RuntimeError("cpu_model_parallel_geometry cannot be nested")
++    if (
++        torch.distributed.is_initialized()
++        or any(
++            group is not None
++            for group in (
++                _WORLD, _INNER_DP_WORLD, _TP, _PP, _DP, _EP, _EPLB, _DCP, _PCP
++            )
++        )
++        or any(group_ref() is not None for group_ref in _groups.values())
++    ):
++        raise RuntimeError(
++            "cpu_model_parallel_geometry requires no existing distributed groups"
++        )
++    token = _cpu_model_parallel_geometry.set(
++        _CPUModelParallelGeometry(tp_rank, tp_size, pp_rank, pp_size)
++    )
++    try:
++        yield
++    finally:
++        _cpu_model_parallel_geometry.reset(token)
++
++
+ @contextmanager
+ def graph_capture(
+     device: torch.device,
+@@ -1728,6 +1811,7 @@
+     backend: str = "nccl",
+     timeout: timedelta | None = None,
+ ):
++    _require_real_distributed_state("init_distributed_environment")
+     logger.debug(
+         "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
+         world_size,
+@@ -1915,6 +1999,7 @@
+     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
+     ranks 8 to 15 belong to the second box.
+     """
++    _require_real_distributed_state("initialize_model_parallel")
+     # Get world size and rank. Ensure some consistencies.
+     assert torch.distributed.is_initialized()
+ 
+@@ -2203,15 +2288,53 @@
+ 
+ 
+ def get_tensor_model_parallel_world_size() -> int:
+-    """Return world size for the tensor model parallel group."""
++    """Return TP world size from construction geometry or the real group."""
++    geometry = _cpu_model_parallel_geometry.get()
++    if geometry is not None:
++        return geometry.tp_size
+     return get_tp_group().world_size
+ 
+ 
+ def get_tensor_model_parallel_rank() -> int:
+-    """Return my rank for the tensor model parallel group."""
++    """Return TP rank from construction geometry or the real group."""
++    geometry = _cpu_model_parallel_geometry.get()
++    if geometry is not None:
++        return geometry.tp_rank
+     return get_tp_group().rank_in_group
+ 
+ 
++def get_pipeline_model_parallel_world_size() -> int:
++    """Return PP world size from construction geometry or the real group."""
++    geometry = _cpu_model_parallel_geometry.get()
++    if geometry is not None:
++        return geometry.pp_size
++    return get_pp_group().world_size
++
++
++def get_pipeline_model_parallel_rank() -> int:
++    """Return PP rank from construction geometry or the real group."""
++    geometry = _cpu_model_parallel_geometry.get()
++    if geometry is not None:
++        return geometry.pp_rank
++    return get_pp_group().rank_in_group
++
++
++def is_pipeline_model_parallel_first_rank() -> bool:
++    """Whether this is the first PP rank (metadata only)."""
++    geometry = _cpu_model_parallel_geometry.get()
++    if geometry is not None:
++        return geometry.pp_rank == 0
++    return get_pp_group().is_first_rank
++
++
++def is_pipeline_model_parallel_last_rank() -> bool:
++    """Whether this is the last PP rank (metadata only)."""
++    geometry = _cpu_model_parallel_geometry.get()
++    if geometry is not None:
++        return geometry.pp_rank == geometry.pp_size - 1
++    return get_pp_group().is_last_rank
++
++
+ def get_node_count() -> int:
+     """Return the total number of nodes in the distributed environment."""
+     assert _NODE_COUNT is not None, "distributed environment is not initialized"
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -62,6 +62,14 @@
+ 
+             logger.debug("Loading weights on %s ...", load_device)
+             self.load_weights(model, model_config)
++            # The terminal wrapper must have skipped raw loading and armed its
++            # post-load restore before uninitialized holder buffers are used.
++            import sys
++
++            prepared_models = sys.modules.get("pm_rewind_cpu_model")
++            if prepared_models is not None:
++                prepared_models.confirm_terminal_restore_pending(model)
++
+ 
+             # Log peak GPU memory after loading weights. This is needed
+             # to have test coverage on peak memory for online quantization.
+--- a/vllm/model_executor/model_loader/default_loader.py
++++ b/vllm/model_executor/model_loader/default_loader.py
+@@ -413,6 +413,14 @@
+ 
+     @instrument(span_name="Load weights")
+     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
++        # A pure-meta prepared model relies on terminal snapshot buffers as
++        # well as weights. Reject the snapshot plugin's raw-loader fallback.
++        import sys
++
++        prepared_models = sys.modules.get("pm_rewind_cpu_model")
++        if prepared_models is not None:
++            prepared_models.reject_raw_checkpoint_load(model)
++
+         if model_config.quantization == "torchao":
+             quant_config = get_quant_config(model_config, self.load_config)
+             if (
+--- a/vllm/model_executor/model_loader/utils.py
++++ b/vllm/model_executor/model_loader/utils.py
+@@ -43,6 +43,23 @@
+     model_config: ModelConfig | None = None,
+ ) -> nn.Module:
+     """Initialize a model with the given configurations."""
++    # Opt-in native CPU-model handoff. Do not import the helper on the normal
++    # loader path, and never reconstruct a model after an enabled claim fails.
++    # This is the shared creation boundary used by the real TPU runner and its
++    # raw-weight/terminal-restore loaders; all later loading/post-load stays put.
++    import sys
++
++    prepared_models = sys.modules.get("pm_rewind_cpu_model")
++    if prepared_models is not None:
++        prepared_model = prepared_models.consume_prepared_model(
++            vllm_config,
++            model_config=model_config,
++            prefix=prefix,
++            model_class=model_class,
++        )
++        if prepared_model is not None:
++            return prepared_model
++
+     if model_config is None:
+         model_config = vllm_config.model_config
+     if model_class is None:
+--- a/vllm/model_executor/models/utils.py
++++ b/vllm/model_executor/models/utils.py
+@@ -845,12 +845,17 @@
+     Returns:
+         Tuple of (start_layer, end_layer, modules).
+     """
+-    from vllm.distributed.parallel_state import get_pp_group
++    from vllm.distributed.parallel_state import (
++        get_pipeline_model_parallel_rank,
++        get_pipeline_model_parallel_world_size,
++    )
+     from vllm.distributed.utils import get_pp_indices
+     from vllm.model_executor.offloader import get_offloader
+ 
+     start_layer, end_layer = get_pp_indices(
+-        num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
++        num_hidden_layers,
++        get_pipeline_model_parallel_rank(),
++        get_pipeline_model_parallel_world_size(),
+     )
+ 
+     modules = torch.nn.ModuleList(
+--- a/vllm/ray/lazy_utils.py
++++ b/vllm/ray/lazy_utils.py
+@@ -1,15 +1,14 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import sys
++
+ 
+ def is_ray_initialized():
+     """Check if Ray is initialized."""
+     try:
+-        import ray
+-
+-        return ray.is_initialized()
+-    except ImportError:
+-        return False
++        ray = sys.modules.get("ray")
++        return ray is not None and ray.is_initialized()
+     except AttributeError:
+         return False
+ 
+@@ -18,13 +17,11 @@
+     """Check if we are in a Ray actor."""
+ 
+     try:
+-        import ray
+-
++        ray = sys.modules.get("ray")
+         return (
+-            ray.is_initialized()
++            ray is not None
++            and ray.is_initialized()
+             and ray.get_runtime_context().get_actor_id() is not None
+         )
+-    except ImportError:
+-        return False
+     except AttributeError:
+         return False
+--- a/vllm/ray/ray_env.py
++++ b/vllm/ray/ray_env.py
+@@ -10,6 +10,18 @@
+ 
+ CONFIG_HOME = envs.VLLM_CONFIG_ROOT
+ 
++# Env vars that are worker-specific and must NOT be copied from the
++# driver to Ray workers — they are set per-worker after GPU discovery.
++WORKER_SPECIFIC_ENV_VARS: set[str] = {
++    "VLLM_HOST_IP",
++    "VLLM_HOST_PORT",
++    "VLLM_NIXL_SIDE_CHANNEL_HOST",
++    "LOCAL_RANK",
++    "CUDA_VISIBLE_DEVICES",
++    "HIP_VISIBLE_DEVICES",
++    "ROCR_VISIBLE_DEVICES",
++}
++
+ # Env vars that should NOT be copied from the driver to Ray workers.
+ RAY_NON_CARRY_OVER_ENV_VARS_FILE = os.path.join(
+     CONFIG_HOME, "ray_non_carry_over_env_vars.json"
+--- a/vllm/v1/engine/utils.py
++++ b/vllm/v1/engine/utils.py
+@@ -20,7 +20,7 @@
+ from vllm.config import CacheConfig, ParallelConfig, VllmConfig
+ from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+-from vllm.ray.ray_env import get_env_vars_to_copy
++from vllm.ray.ray_env import WORKER_SPECIFIC_ENV_VARS, get_env_vars_to_copy
+ from vllm.utils import numa_utils
+ from vllm.utils.network_utils import (
+     get_open_port,
+@@ -31,7 +31,6 @@
+ from vllm.utils.system_utils import get_mp_context
+ from vllm.v1.engine.coordinator import DPCoordinator
+ from vllm.v1.executor import Executor
+-from vllm.v1.executor.ray_utils import WORKER_SPECIFIC_ENV_VARS
+ from vllm.v1.utils import _SubprocessWrapper, get_engine_client_zmq_addr, shutdown
+ 
+ if TYPE_CHECKING:
+--- a/vllm/v1/executor/ray_executor.py
++++ b/vllm/v1/executor/ray_executor.py
+@@ -13,7 +13,7 @@
+ import vllm.envs as envs
+ from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+-from vllm.ray.ray_env import get_env_vars_to_copy
++from vllm.ray.ray_env import WORKER_SPECIFIC_ENV_VARS, get_env_vars_to_copy
+ from vllm.utils.network_utils import (
+     get_distributed_init_method,
+     get_ip,
+@@ -26,7 +26,6 @@
+     update_runtime_env_for_worker_import,
+ )
+ from vllm.v1.executor.ray_utils import (
+-    WORKER_SPECIFIC_ENV_VARS,
+     FutureWrapper,
+     RayWorkerWrapper,
+     detach_zero_copy_from_model_runner_output,
+--- a/vllm/v1/executor/ray_executor_v2.py
++++ b/vllm/v1/executor/ray_executor_v2.py
+@@ -18,6 +18,7 @@
+ )
+ from vllm.logger import init_logger
+ from vllm.platforms import current_platform
++from vllm.ray.ray_env import WORKER_SPECIFIC_ENV_VARS
+ from vllm.utils.network_utils import (
+     get_distributed_init_method,
+ )
+@@ -31,7 +32,6 @@
+     update_runtime_env_for_worker_import,
+ )
+ from vllm.v1.executor.ray_utils import (
+-    WORKER_SPECIFIC_ENV_VARS,
+     build_actor_name,
+     get_bundles_for_indices,
+     get_bundles_sorted_by_node,
+--- a/vllm/v1/executor/ray_utils.py
++++ b/vllm/v1/executor/ray_utils.py
+@@ -28,17 +28,6 @@
+ logger = init_logger(__name__)
+ PG_WAIT_TIMEOUT = 1800
+ 
+-# Env vars that are worker-specific and must NOT be copied from the
+-# driver to Ray workers — they are set per-worker after GPU discovery.
+-WORKER_SPECIFIC_ENV_VARS: set[str] = {
+-    "VLLM_HOST_IP",
+-    "VLLM_HOST_PORT",
+-    "VLLM_NIXL_SIDE_CHANNEL_HOST",
+-    "LOCAL_RANK",
+-    "CUDA_VISIBLE_DEVICES",
+-    "HIP_VISIBLE_DEVICES",
+-    "ROCR_VISIBLE_DEVICES",
+-}
+ 
+ try:
+     import ray
+--- a/vllm_torchtpu/executors/ray_distributed_executor.py
++++ b/vllm_torchtpu/executors/ray_distributed_executor.py
+@@ -24,7 +24,7 @@
+ from ray.util.placement_group import PlacementGroup
+ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+ from vllm.platforms import current_platform
+-from vllm.ray.ray_env import get_env_vars_to_copy
++from vllm.ray.ray_env import WORKER_SPECIFIC_ENV_VARS, get_env_vars_to_copy
+ from vllm.sequence import IntermediateTensors
+ from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
+ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+@@ -32,7 +32,7 @@
+     RayDistributedExecutor as RayDistributedExecutorV1,
+ )
+ from vllm.v1.executor.ray_executor import RayWorkerMetaData
+-from vllm.v1.executor.ray_utils import WORKER_SPECIFIC_ENV_VARS, _wait_until_pg_ready
++from vllm.v1.executor.ray_utils import _wait_until_pg_ready
+ from vllm.v1.executor.ray_utils import RayWorkerWrapper as RayWorkerWrapperV1
+ from vllm.v1.outputs import ModelRunnerOutput
+ 
+--- a/vllm_torchtpu/executors/ray_distributed_executor_v2.py
++++ b/vllm_torchtpu/executors/ray_distributed_executor_v2.py
+@@ -24,12 +24,12 @@
+ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+ from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+ from vllm.platforms import current_platform
++from vllm.ray.ray_env import WORKER_SPECIFIC_ENV_VARS
+ from vllm.utils.network_utils import get_ip, get_open_port
+ from vllm.v1.executor.multiproc_executor import FutureWrapper
+ from vllm.v1.executor.ray_env_utils import get_driver_env_vars
+ from vllm.v1.executor.ray_executor_v2 import RayExecutorV2, RayWorkerHandle
+ from vllm.v1.executor.ray_utils import (
+-    WORKER_SPECIFIC_ENV_VARS,
+     _wait_until_pg_ready,
+     build_actor_name,
+     get_bundles_sorted_by_node,
+--- a/vllm_torchtpu/platforms/tpu_platform.py
++++ b/vllm_torchtpu/platforms/tpu_platform.py
+@@ -991,7 +991,13 @@
+                         "Multihost data parallelism requires the Ray V2 "
+                         "executor. Set VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1."
+                     )
+-            if vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
++            from vllm.distributed.parallel_state import is_cpu_model_preparation
++
++            if is_cpu_model_preparation():
++                # Static model construction must not freeze Ray's import-time
++                # worker identity. The real worker config binds the executor later.
++                parallel_config.distributed_executor_backend = "ray"
++            elif vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
+                 from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
+                     RayDistributedExecutorV2,
+                 )

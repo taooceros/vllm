@@ -70,6 +70,46 @@
       "bytes": 9188
     },
     {
+      "path": "scripts/pm_cpu_model_sdk.patch",
+      "sha256": "8ebb029585e404e3368d9eed42e64012557ae1bc467370bc7d3dba226dea4f82",
+      "bytes": 19424
+    },
+    {
+      "path": "scripts/pm_ray_zygote.py",
+      "sha256": "faa95750d800638cb4006e9c91c878c039a686c11b5f4298231a13598a63a937",
+      "bytes": 47197
+    },
+    {
+      "path": "scripts/pm_rewind_cpu_model.py",
+      "sha256": "e17743e7f8bda786b55a1491b8f75f091d6298fd2a7a870eddc65274ef2079fc",
+      "bytes": 53568
+    },
+    {
+      "path": "scripts/pm_source_patches.py",
+      "sha256": "d4b16a1fd78b6520314e6fa9ae266d4f7fa0673de0346beaa0a96e666001304e",
+      "bytes": 31243
+    },
+    {
+      "path": "scripts/pm_torchtpu_plugin.py",
+      "sha256": "8b96c7e9acf9b568b6287daf7f81acebc00baf620720e3a53bb658d34b72d43f",
+      "bytes": 49632
+    },
+    {
+      "path": "scripts/pm_zygote.py",
+      "sha256": "5f3cd8d6095b6969f4144d452f353362efc3070a5f96affc56aa8d2143373370",
+      "bytes": 9638
+    },
+    {
+      "path": "scripts/torchtpu_load_plugin.py",
+      "sha256": "0e00e2e702eeb9769016275003304de5e1b05499ea5e2d19f60707d7c3cbeca9",
+      "bytes": 3591
+    },
+    {
+      "path": "scripts/torchtpu_ray_pin_plugin.py",
+      "sha256": "597d412bdd4debc9c4a6f5070dbb5a0b582db754d248de7064ac7f2bc89f6e46",
+      "bytes": 5179
+    },
+    {
       "path": "tests/test_full_bf16_state.py",
       "sha256": "369f5f851fca34cc5b85f41f24e0fea7c47d3f95c3a8f24ff5ce02496bead7f6",
       "bytes": 4909
