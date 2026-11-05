@@ -101,6 +101,11 @@ class EngineSettings:
     # Autoscale boot overlap (hetero/state_delivery.py): > 0 makes every worker wait, right before its
     # first device touch, for the concurrent fetch to publish its rank's startup state; 0 = off.
     state_gate_timeout_s: float = 0.0
+    # vLLM's checkpoint read strategy for the normal loader (LoadConfig.safetensors_load_strategy):
+    # None leaves vLLM's choice (lazy mmap; auto-prefetch only on NFS/Lustre, not GCS FUSE).
+    # "prefetch" reads the files into the page cache from background threads while loading.
+    safetensors_load_strategy: Optional[str] = None
+    safetensors_prefetch_num_threads: Optional[int] = None
 
     def __post_init__(self) -> None:
         for field, choices in (
@@ -149,6 +154,14 @@ class EngineSettings:
         if (isinstance(self.state_gate_timeout_s, bool) or not isinstance(self.state_gate_timeout_s, (int, float))
                 or self.state_gate_timeout_s < 0):
             raise ValueError("state_gate_timeout_s must be a number >= 0 (0 = off)")
+        if self.safetensors_load_strategy not in (None, "lazy", "eager", "prefetch"):
+            raise ValueError(f"unsupported safetensors_load_strategy {self.safetensors_load_strategy!r}")
+        if self.safetensors_prefetch_num_threads is not None and (
+                isinstance(self.safetensors_prefetch_num_threads, bool)
+                or not isinstance(self.safetensors_prefetch_num_threads, int)
+                or self.safetensors_prefetch_num_threads < 1
+                or self.safetensors_load_strategy != "prefetch"):
+            raise ValueError("safetensors_prefetch_num_threads must be an int >= 1 with safetensors_load_strategy='prefetch'")
         if self.state_gate_timeout_s and self.prespawn:
             raise ValueError("state_gate_timeout_s is for fresh-host boots; a pre-spawned engine waits on its release gate")
         if self.backend_revision != BACKEND_REVISION:
@@ -170,6 +183,11 @@ class EngineSettings:
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
+
+    def load_kwargs(self) -> Dict[str, Any]:
+        """vLLM EngineArgs load-config overrides; empty unless set, so default boots pass vLLM's defaults."""
+        return {k: getattr(self, k) for k in ("safetensors_load_strategy", "safetensors_prefetch_num_threads")
+                if getattr(self, k) is not None}
 
 
 @ray.remote
@@ -461,6 +479,7 @@ class HeteroEngine:
             trust_remote_code=True,
             disable_log_stats=False,
             limit_mm_per_prompt={"image": 0, "audio": 0, "video": 0},
+            **self.settings.load_kwargs(),
         )
         vllm_config = engine_args.create_engine_config()
         vllm_config.parallel_config.placement_group = pg
