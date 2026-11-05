@@ -106,6 +106,14 @@ class EngineSettings:
     # "prefetch" reads the files into the page cache from background threads while loading.
     safetensors_load_strategy: Optional[str] = None
     safetensors_prefetch_num_threads: Optional[int] = None
+    # vLLM LoadConfig.load_format: None leaves vLLM's default ("auto"). "runai_streamer" streams the
+    # checkpoint from object storage (model = gs://...) with the Run:ai model streamer.
+    load_format: Optional[str] = None
+    # vLLM tokenizer path (None: the model path). A gs:// model with the tokenizer left at the model
+    # makes vLLM pull every non-weight object under the prefix to local disk; point it at /models.
+    tokenizer: Optional[str] = None
+    # vLLM LoadConfig.model_loader_extra_config, e.g. {"memory_limit": <bytes>} for runai_streamer.
+    model_loader_extra_config: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         for field, choices in (
@@ -162,6 +170,14 @@ class EngineSettings:
                 or self.safetensors_prefetch_num_threads < 1
                 or self.safetensors_load_strategy != "prefetch"):
             raise ValueError("safetensors_prefetch_num_threads must be an int >= 1 with safetensors_load_strategy='prefetch'")
+        if self.load_format not in (None, "auto", "safetensors", "runai_streamer"):
+            raise ValueError(f"unsupported load_format {self.load_format!r}")
+        if self.load_format == "runai_streamer" and self.weight_snapshot != "off":
+            raise ValueError("load_format='runai_streamer' is a normal-loader setting (weight_snapshot='off')")
+        if self.tokenizer is not None and not isinstance(self.tokenizer, str):
+            raise ValueError("tokenizer must be a path string")
+        if self.model_loader_extra_config is not None and not isinstance(self.model_loader_extra_config, dict):
+            raise ValueError("model_loader_extra_config must be a JSON object")
         if self.state_gate_timeout_s and self.prespawn:
             raise ValueError("state_gate_timeout_s is for fresh-host boots; a pre-spawned engine waits on its release gate")
         if self.backend_revision != BACKEND_REVISION:
@@ -186,7 +202,8 @@ class EngineSettings:
 
     def load_kwargs(self) -> Dict[str, Any]:
         """vLLM EngineArgs load-config overrides; empty unless set, so default boots pass vLLM's defaults."""
-        return {k: getattr(self, k) for k in ("safetensors_load_strategy", "safetensors_prefetch_num_threads")
+        return {k: getattr(self, k) for k in ("safetensors_load_strategy", "safetensors_prefetch_num_threads",
+                                              "load_format", "tokenizer", "model_loader_extra_config")
                 if getattr(self, k) is not None}
 
 
