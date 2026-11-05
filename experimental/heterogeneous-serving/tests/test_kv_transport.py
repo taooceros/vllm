@@ -24,7 +24,7 @@ PAGE, HEAD_DIM, ORIGINAL, RAW_HEADS, BLOCKS = 8, 4, 4, 16, 12
 
 class FullAttentionSpec:
     def __init__(self, heads):
-        self.block_size = self.storage_block_size = PAGE
+        self.block_size = self.num_states = PAGE
         self.head_size = HEAD_DIM
         self.num_kv_heads = heads
 

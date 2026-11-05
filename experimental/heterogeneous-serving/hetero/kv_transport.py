@@ -125,7 +125,9 @@ def cache_layout(runner: Any) -> dict[str, Any]:
                 memberships[index].append(group_id)
             rows.append({"layer_name": name, "array_index": index,
                          "spec_type": kind, "block_size": int(spec.block_size),
-                         "storage_block_size": int(spec.storage_block_size),
+                         # vLLM 273a049 dropped KVCacheSpec.storage_block_size; the physical page
+                         # tpu_inference allocates is spec.num_states (kv_cache_manager.py:991).
+                         "storage_block_size": int(spec.num_states),
                          "head_size": int(spec.head_size),
                          "num_kv_heads": int(spec.num_kv_heads),
                          "head_semantics": _native_head_semantics(runner, name, spec),
