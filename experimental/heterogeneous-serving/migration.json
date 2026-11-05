@@ -70,6 +70,21 @@
       "bytes": 9188
     },
     {
+      "path": "hetero/vproc/engine_vllm.py",
+      "sha256": "ec431a56f1fd7111223300427b7d2d80b8c099ba6af8280b99f150a5a3d401d7",
+      "bytes": 49196
+    },
+    {
+      "path": "hetero/vproc/frontend.py",
+      "sha256": "95fa3789a06bc5ba960a5c6f4396b820ab2de9d0dbb5414f866caf72670c9a29",
+      "bytes": 60979
+    },
+    {
+      "path": "hetero/vproc/vllm_executor.py",
+      "sha256": "ae4377e82bdce046d4ccf62a88f2dbf83af12a4123c4084acfc527090f37e785",
+      "bytes": 15638
+    },
+    {
       "path": "tests/test_full_bf16_state.py",
       "sha256": "369f5f851fca34cc5b85f41f24e0fea7c47d3f95c3a8f24ff5ce02496bead7f6",
       "bytes": 4909
@@ -78,6 +93,21 @@
       "path": "tests/test_kv_transport.py",
       "sha256": "6e0822127c749224d8c17850e324dde69f60213645fc9e047930bb127d08f43e",
       "bytes": 9735
+    },
+    {
+      "path": "tests/test_vproc_frontend.py",
+      "sha256": "37aceb21b98d9de46afe9f385f52f27bece7c0f132fcb86768b77fd533f741d0",
+      "bytes": 25209
+    },
+    {
+      "path": "tests/test_vproc_layout_switch_frontend.py",
+      "sha256": "a9788ad50ec474fdbbdbfd54722a9ca8d728e29b4a3c3236db4540b7812df403",
+      "bytes": 50841
+    },
+    {
+      "path": "tests/test_vproc_surface.py",
+      "sha256": "31f8dad5ffa84637987a04e807394921ac69501d6986d16368771086bfd60a3c",
+      "bytes": 34630
     }
   ]
 }
