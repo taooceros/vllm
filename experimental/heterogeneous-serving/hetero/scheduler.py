@@ -40,6 +40,7 @@ class HeteroScheduler(AsyncScheduler):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self._skip_zero_block_ids: Set[int] = set()
         self.omp_fenced: Set[str] = set()
         self.omp_inflight_batches: Dict[int, Any] = {}
         self.omp_iterations: List[Dict[str, Any]] = []
@@ -272,7 +273,7 @@ class HeteroScheduler(AsyncScheduler):
         if original is not None:
             self.running = [r for r in original if r.request_id not in self.omp_fenced]
             waiting = {}
-            for name in ("waiting", "skipped_waiting"):
+            for name in ("waiting", "kv_holding_waiting"):
                 queue = getattr(self, name)
                 waiting[name] = list(queue)
                 queue.remove_requests(r for r in waiting[name] if r.request_id in self.omp_fenced)
@@ -299,11 +300,23 @@ class HeteroScheduler(AsyncScheduler):
             self.omp_rows_by_output[id(output)] = (row, scheduled)
         return output
 
-    def _preempt_request(self, request: Any, timestamp: float) -> None:
+    def _get_new_block_ids_to_zero(self) -> Any:
+        # vLLM 273a049 removed Scheduler._skip_zero_block_ids; keep the same contract here: block ids
+        # registered in it (KV imported into freshly allocated blocks, engine_actor) are not zeroed
+        # by the next step, and the set is cleared by that step.
+        new_block_ids = super()._get_new_block_ids_to_zero()
+        if not self.needs_kv_cache_zeroing or not self._skip_zero_block_ids:
+            return new_block_ids
+        skip = self._skip_zero_block_ids
+        remaining = [b for b in (new_block_ids or ()) if b not in skip]
+        skip.clear()
+        return remaining or None
+
+    def _preempt_request(self, request: Any, timestamp: float, drop_stale_output: bool = False) -> None:
         retired = max(0, request.num_computed_tokens - request.num_in_flight_tokens)
         self.omp_native_replay_requests[request.request_id] = max(
             retired, self.omp_native_replay_requests.get(request.request_id, 0))
-        super()._preempt_request(request, timestamp)
+        super()._preempt_request(request, timestamp, drop_stale_output=drop_stale_output)
 
     def update_from_output(self, scheduler_output: Any, model_runner_output: Any) -> Any:
         result = super().update_from_output(scheduler_output, model_runner_output)
@@ -662,12 +675,15 @@ def _unsupported_continuation(params: Any) -> List[str]:
     if int(getattr(params, "n", 1)) != 1:
         reasons.append("multi_sample_requests_not_supported")
     if any(getattr(params, field, None) is not None
-           for field in ("logprobs", "prompt_logprobs", "logprob_token_ids")):
+           for field in ("logprobs", "prompt_logprobs", "logprob_token_ids",
+                         "prompt_logprob_token_ids")):
         reasons.append("logprob_accounting_not_transferable")
     # Snapshot sampling omits output_kind and reconstructs the native cumulative default.
     if hasattr(params, "output_kind") and getattr(params.output_kind, "name", None) != "CUMULATIVE":
         reasons.append("noncumulative_frontend_output_not_supported")
-    for field in ("extra_args", "thinking_token_budget", "repetition_detection"):
+    # watermarking / trace_decode_token_ids are SamplingParams fields added after v0.26.0-era vLLM.
+    for field in ("extra_args", "thinking_token_budget", "repetition_detection", "watermarking",
+                  "trace_decode_token_ids"):
         if getattr(params, field, None) is not None:
             reasons.append(f"{field}_state_not_transferable")
     return reasons
