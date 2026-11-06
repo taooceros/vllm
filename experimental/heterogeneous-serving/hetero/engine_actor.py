@@ -98,6 +98,22 @@ class EngineSettings:
     # before the release; the released worker waits for it (bounded) and restores from it.
     preread: bool = False
     preread_timeout_s: float = 900.0
+    # Autoscale boot overlap (hetero/state_delivery.py): > 0 makes every worker wait, right before its
+    # first device touch, for the concurrent fetch to publish its rank's startup state; 0 = off.
+    state_gate_timeout_s: float = 0.0
+    # vLLM's checkpoint read strategy for the normal loader (LoadConfig.safetensors_load_strategy):
+    # None leaves vLLM's choice (lazy mmap; auto-prefetch only on NFS/Lustre, not GCS FUSE).
+    # "prefetch" reads the files into the page cache from background threads while loading.
+    safetensors_load_strategy: Optional[str] = None
+    safetensors_prefetch_num_threads: Optional[int] = None
+    # vLLM LoadConfig.load_format: None leaves vLLM's default ("auto"). "runai_streamer" streams the
+    # checkpoint from object storage (model = gs://...) with the Run:ai model streamer.
+    load_format: Optional[str] = None
+    # vLLM tokenizer path (None: the model path). A gs:// model with the tokenizer left at the model
+    # makes vLLM pull every non-weight object under the prefix to local disk; point it at /models.
+    tokenizer: Optional[str] = None
+    # vLLM LoadConfig.model_loader_extra_config, e.g. {"memory_limit": <bytes>} for runai_streamer.
+    model_loader_extra_config: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         for field, choices in (
@@ -143,6 +159,27 @@ class EngineSettings:
         if (isinstance(self.preread_timeout_s, bool) or not isinstance(self.preread_timeout_s, (int, float))
                 or not self.preread_timeout_s > 0):
             raise ValueError("preread_timeout_s must be a positive number")
+        if (isinstance(self.state_gate_timeout_s, bool) or not isinstance(self.state_gate_timeout_s, (int, float))
+                or self.state_gate_timeout_s < 0):
+            raise ValueError("state_gate_timeout_s must be a number >= 0 (0 = off)")
+        if self.safetensors_load_strategy not in (None, "lazy", "eager", "prefetch"):
+            raise ValueError(f"unsupported safetensors_load_strategy {self.safetensors_load_strategy!r}")
+        if self.safetensors_prefetch_num_threads is not None and (
+                isinstance(self.safetensors_prefetch_num_threads, bool)
+                or not isinstance(self.safetensors_prefetch_num_threads, int)
+                or self.safetensors_prefetch_num_threads < 1
+                or self.safetensors_load_strategy != "prefetch"):
+            raise ValueError("safetensors_prefetch_num_threads must be an int >= 1 with safetensors_load_strategy='prefetch'")
+        if self.load_format not in (None, "auto", "safetensors", "runai_streamer"):
+            raise ValueError(f"unsupported load_format {self.load_format!r}")
+        if self.load_format == "runai_streamer" and self.weight_snapshot != "off":
+            raise ValueError("load_format='runai_streamer' is a normal-loader setting (weight_snapshot='off')")
+        if self.tokenizer is not None and not isinstance(self.tokenizer, str):
+            raise ValueError("tokenizer must be a path string")
+        if self.model_loader_extra_config is not None and not isinstance(self.model_loader_extra_config, dict):
+            raise ValueError("model_loader_extra_config must be a JSON object")
+        if self.state_gate_timeout_s and self.prespawn:
+            raise ValueError("state_gate_timeout_s is for fresh-host boots; a pre-spawned engine waits on its release gate")
         if self.backend_revision != BACKEND_REVISION:
             raise ValueError(
                 f"backend_revision {self.backend_revision!r} does not match "
@@ -162,6 +199,12 @@ class EngineSettings:
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
+
+    def load_kwargs(self) -> Dict[str, Any]:
+        """vLLM EngineArgs load-config overrides; empty unless set, so default boots pass vLLM's defaults."""
+        return {k: getattr(self, k) for k in ("safetensors_load_strategy", "safetensors_prefetch_num_threads",
+                                              "load_format", "tokenizer", "model_loader_extra_config")
+                if getattr(self, k) is not None}
 
 
 @ray.remote
@@ -406,6 +449,7 @@ class HeteroEngine:
             "exec_bank_sabotage_rank": self.settings.exec_bank_sabotage_rank,
             "preread": self.settings.preread,
             "preread_timeout_s": float(self.settings.preread_timeout_s),
+            "state_gate_timeout_s": float(self.settings.state_gate_timeout_s),
             # Fresh per initialize(): unanimity votes of an earlier attempt are never read.
             "exec_bank_nonce": uuid.uuid4().hex,
         }
@@ -452,6 +496,7 @@ class HeteroEngine:
             trust_remote_code=True,
             disable_log_stats=False,
             limit_mm_per_prompt={"image": 0, "audio": 0, "video": 0},
+            **self.settings.load_kwargs(),
         )
         vllm_config = engine_args.create_engine_config()
         vllm_config.parallel_config.placement_group = pg
